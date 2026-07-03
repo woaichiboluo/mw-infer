@@ -1,0 +1,87 @@
+# Copyright (c) OpenMMLab. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Based on MMDeploy's FindONNXRUNTIME.cmake and adapted for MwInfer.
+
+set(ONNXRUNTIME_ROOT "" CACHE PATH "Optional ONNX Runtime installation prefix.")
+set(ONNXRUNTIME_DIR "" CACHE PATH "Optional ONNX Runtime installation prefix.")
+
+if(NOT ONNXRUNTIME_DIR AND ONNXRUNTIME_ROOT)
+  set(ONNXRUNTIME_DIR "${ONNXRUNTIME_ROOT}")
+endif()
+
+if(NOT ONNXRUNTIME_DIR AND DEFINED ENV{ONNXRUNTIME_DIR})
+  set(ONNXRUNTIME_DIR "$ENV{ONNXRUNTIME_DIR}")
+endif()
+
+if(NOT ONNXRUNTIME_DIR AND DEFINED ENV{ONNXRUNTIME_ROOT})
+  set(ONNXRUNTIME_DIR "$ENV{ONNXRUNTIME_ROOT}")
+endif()
+
+find_path(
+  ONNXRUNTIME_INCLUDE_DIR
+  NAMES onnxruntime_cxx_api.h
+  HINTS ${ONNXRUNTIME_DIR}
+  PATH_SUFFIXES include include/onnxruntime
+  NO_SYSTEM_ENVIRONMENT_PATH)
+
+find_library(
+  ONNXRUNTIME_LIBRARY
+  NAMES onnxruntime
+  HINTS ${ONNXRUNTIME_DIR}
+  PATH_SUFFIXES lib lib64 lib/x64
+  NO_SYSTEM_ENVIRONMENT_PATH)
+
+find_library(
+  ONNXRUNTIME_CUDA_PROVIDER_LIBRARY
+  NAMES onnxruntime_providers_cuda
+  HINTS ${ONNXRUNTIME_DIR}
+  PATH_SUFFIXES lib lib64 lib/x64
+  NO_SYSTEM_ENVIRONMENT_PATH)
+
+find_library(
+  ONNXRUNTIME_SHARED_PROVIDER_LIBRARY
+  NAMES onnxruntime_providers_shared
+  HINTS ${ONNXRUNTIME_DIR}
+  PATH_SUFFIXES lib lib64 lib/x64
+  NO_SYSTEM_ENVIRONMENT_PATH)
+
+include(FindPackageHandleStandardArgs)
+find_package_handle_standard_args(
+  ONNXRuntime REQUIRED_VARS ONNXRUNTIME_INCLUDE_DIR ONNXRUNTIME_LIBRARY)
+
+if(ONNXRuntime_FOUND AND NOT TARGET ONNXRuntime::ONNXRuntime)
+  add_library(ONNXRuntime::ONNXRuntime UNKNOWN IMPORTED)
+  set_target_properties(
+    ONNXRuntime::ONNXRuntime
+    PROPERTIES IMPORTED_LOCATION "${ONNXRUNTIME_LIBRARY}"
+               INTERFACE_INCLUDE_DIRECTORIES "${ONNXRUNTIME_INCLUDE_DIR}")
+endif()
+
+if(ONNXRUNTIME_CUDA_PROVIDER_LIBRARY)
+  set(ONNXRuntime_CUDA_PROVIDER_FOUND TRUE)
+else()
+  set(ONNXRuntime_CUDA_PROVIDER_FOUND FALSE)
+endif()
+
+if(ONNXRuntime_FOUND
+   AND ONNXRUNTIME_CUDA_PROVIDER_LIBRARY
+   AND NOT TARGET ONNXRuntime::CUDAProvider)
+  add_library(ONNXRuntime::CUDAProvider UNKNOWN IMPORTED)
+  set_target_properties(
+    ONNXRuntime::CUDAProvider
+    PROPERTIES IMPORTED_LOCATION "${ONNXRUNTIME_CUDA_PROVIDER_LIBRARY}")
+endif()
+
+if(ONNXRuntime_FOUND
+   AND ONNXRUNTIME_SHARED_PROVIDER_LIBRARY
+   AND NOT TARGET ONNXRuntime::SharedProvider)
+  add_library(ONNXRuntime::SharedProvider UNKNOWN IMPORTED)
+  set_target_properties(
+    ONNXRuntime::SharedProvider
+    PROPERTIES IMPORTED_LOCATION "${ONNXRUNTIME_SHARED_PROVIDER_LIBRARY}")
+endif()
+
+mark_as_advanced(ONNXRUNTIME_INCLUDE_DIR ONNXRUNTIME_LIBRARY
+                 ONNXRUNTIME_CUDA_PROVIDER_LIBRARY
+                 ONNXRUNTIME_SHARED_PROVIDER_LIBRARY)
