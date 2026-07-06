@@ -9,7 +9,7 @@
 namespace mw::infer {
 
 std::unique_ptr<IBackend> CreateOnnxCpuBackend(const RuntimeConfig& config);
-std::unique_ptr<IBackend> CreateOnnxCudaBackend(const RuntimeConfig& config);
+std::unique_ptr<IBackend> CreateOnnxGpuBackend(const RuntimeConfig& config);
 std::unique_ptr<IBackend> CreateTensorRTBackend(const RuntimeConfig& config);
 
 }  // namespace mw::infer

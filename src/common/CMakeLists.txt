@@ -1,4 +1,4 @@
-add_library(MwInferCommon device.cc memory.cc model.cc tensor.cc)
+add_library(MwInferCommon device.cc memory.cc model.cc)
 add_library(MwInfer::Common ALIAS MwInferCommon)
 
 target_include_directories(

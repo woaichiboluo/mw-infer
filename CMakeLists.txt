@@ -46,6 +46,45 @@ endif()
 add_subdirectory(src/common)
 
 if(MW_INFER_BUILD_RUNTIME)
+  find_package(
+    OpenCV REQUIRED
+    COMPONENTS core imgproc imgcodecs
+    OPTIONAL_COMPONENTS cudaarithm cudawarping cudaimgproc)
+
+  set(MW_INFER_WITH_OPENCV_CUDA OFF)
+  set(MW_INFER_OPENCV_CUDA_LIBS "")
+
+  if(TARGET opencv_cudaarithm
+     AND TARGET opencv_cudawarping
+     AND TARGET opencv_cudaimgproc)
+    set(MW_INFER_WITH_OPENCV_CUDA ON)
+    set(MW_INFER_OPENCV_CUDA_LIBS opencv_cudaarithm opencv_cudawarping
+                                  opencv_cudaimgproc)
+  else()
+    foreach(_opencv_lib IN LISTS OpenCV_LIBS OpenCV_LIB_COMPONENTS)
+      if(_opencv_lib MATCHES "cudaarithm")
+        set(_MW_INFER_OPENCV_CUDAARITHM_LIB "${_opencv_lib}")
+      elseif(_opencv_lib MATCHES "cudawarping")
+        set(_MW_INFER_OPENCV_CUDAWARPING_LIB "${_opencv_lib}")
+      elseif(_opencv_lib MATCHES "cudaimgproc")
+        set(_MW_INFER_OPENCV_CUDAIMGPROC_LIB "${_opencv_lib}")
+      endif()
+    endforeach()
+
+    if(_MW_INFER_OPENCV_CUDAARITHM_LIB
+       AND _MW_INFER_OPENCV_CUDAWARPING_LIB
+       AND _MW_INFER_OPENCV_CUDAIMGPROC_LIB)
+      set(MW_INFER_WITH_OPENCV_CUDA ON)
+      set(MW_INFER_OPENCV_CUDA_LIBS
+          "${_MW_INFER_OPENCV_CUDAARITHM_LIB}"
+          "${_MW_INFER_OPENCV_CUDAWARPING_LIB}"
+          "${_MW_INFER_OPENCV_CUDAIMGPROC_LIB}")
+    endif()
+  endif()
+
+  message(STATUS "MwInfer OpenCV: ${OpenCV_VERSION}")
+  message(STATUS "MwInfer OpenCV CUDA: ${MW_INFER_WITH_OPENCV_CUDA}")
+
   add_subdirectory(src/runtime)
 endif()
 

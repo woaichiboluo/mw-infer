@@ -1,10 +1,12 @@
-#ifndef MW_INFER_RUNTIME_MEMORY_H_
-#define MW_INFER_RUNTIME_MEMORY_H_
+#ifndef MW_INFER_COMMON_MEMORY_H_
+#define MW_INFER_COMMON_MEMORY_H_
 
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <vector>
+
+#include "mw/infer/common/device.h"
 
 namespace mw::infer {
 
@@ -22,24 +24,31 @@ class MemoryView {
   std::size_t size_bytes_ = 0;
 };
 
-class MemoryBuffer {
+class Buffer {
  public:
-  MemoryBuffer() = default;
-  explicit MemoryBuffer(std::vector<std::byte> bytes);
-  MemoryBuffer(std::shared_ptr<void> data, std::size_t size_bytes);
+  Buffer() = default;
+  explicit Buffer(std::vector<std::byte> bytes, Device device = Device::Cpu());
+  Buffer(Device device, std::size_t size_bytes);
+  Buffer(Device device, std::shared_ptr<void> data, std::size_t size_bytes);
+  Buffer(Device device, void* data, std::size_t size_bytes);
 
   void* data();
   const void* data() const;
   std::size_t size_bytes() const;
   bool empty() const;
+  const Device& device() const;
   MemoryView view() const;
+  Buffer Slice(std::size_t offset, std::size_t size_bytes) const;
 
  private:
-  std::vector<std::byte> owned_bytes_;
-  std::shared_ptr<void> external_data_;
-  std::size_t external_size_bytes_ = 0;
+  Buffer(Device device, std::shared_ptr<void> data, std::size_t size_bytes,
+         bool);
+
+  Device device_;
+  std::shared_ptr<void> data_;
+  std::size_t size_bytes_ = 0;
 };
 
 }  // namespace mw::infer
 
-#endif  // MW_INFER_RUNTIME_MEMORY_H_
+#endif  // MW_INFER_COMMON_MEMORY_H_

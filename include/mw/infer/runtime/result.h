@@ -1,15 +1,11 @@
 #ifndef MW_INFER_RESULT_H_
 #define MW_INFER_RESULT_H_
 
-#include <vector>
-
-#include "mw/infer/common/tensor.h"
+#include "mw/infer/runtime/infer_outputs.h"
 
 namespace mw::infer {
 
-struct InferenceResult {
-  std::vector<Tensor> outputs;
-};
+using InferenceResult = InferOutputs;
 
 }  // namespace mw::infer
 

@@ -20,8 +20,8 @@ std::string_view BackendName(BackendKind backend) {
   switch (backend) {
     case BackendKind::kOnnxCpu:
       return "onnx_cpu";
-    case BackendKind::kOnnxCuda:
-      return "onnx_cuda";
+    case BackendKind::kOnnxGpu:
+      return "onnx_gpu";
     case BackendKind::kTensorRT:
       return "tensorrt";
   }
@@ -39,9 +39,9 @@ std::unique_ptr<IBackend> CreateBackend(const RuntimeConfig& config) {
 #else
       throw DisabledBackendError(config.backend);
 #endif
-    case BackendKind::kOnnxCuda:
+    case BackendKind::kOnnxGpu:
 #if MW_INFER_WITH_ONNXRUNTIME_CUDA
-      return CreateOnnxCudaBackend(config);
+      return CreateOnnxGpuBackend(config);
 #else
       throw DisabledBackendError(config.backend);
 #endif

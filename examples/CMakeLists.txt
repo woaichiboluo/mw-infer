@@ -13,3 +13,9 @@ endif()
 
 add_executable(mw_infer_inspect inspect_model.cc)
 target_link_libraries(mw_infer_inspect PRIVATE MwInfer::Runtime CLI11::CLI11)
+
+if(MW_INFER_WITH_ONNXRUNTIME)
+  add_executable(mw_infer_onnx_batch onnx_batch_infer.cc)
+  target_link_libraries(mw_infer_onnx_batch PRIVATE MwInfer::Runtime
+                                                    CLI11::CLI11)
+endif()

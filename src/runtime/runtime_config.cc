@@ -34,7 +34,7 @@ void ValidateRuntimeConfig(const RuntimeConfig& config) {
 
   switch (config.backend) {
     case BackendKind::kOnnxCpu:
-    case BackendKind::kOnnxCuda:
+    case BackendKind::kOnnxGpu:
       if (config.model.format != ModelFormat::kOnnx) {
         throw std::invalid_argument(
             "ONNX Runtime backends require a .onnx model");

@@ -4,9 +4,7 @@
 #include <memory>
 #include <vector>
 
-#include "mw/infer/common/tensor.h"
 #include "mw/infer/runtime/backend.h"
-#include "mw/infer/runtime/result.h"
 #include "mw/infer/runtime/runtime_config.h"
 
 namespace mw::infer {
@@ -16,9 +14,14 @@ class Session {
   explicit Session(RuntimeConfig config);
 
   const RuntimeConfig& config() const;
-  InferenceResult Predict(const std::vector<Tensor>& inputs);
+  BackendKind backend_kind() const;
+  const InferOutputs& InferBatch(const std::vector<cv::Mat>& inputs);
+  const InferOutputs& InferBatch(const std::vector<cv::cuda::GpuMat>& inputs);
+  std::unique_ptr<Session> Clone() const;
 
  private:
+  Session(RuntimeConfig config, std::unique_ptr<IBackend> backend);
+
   RuntimeConfig config_;
   std::unique_ptr<IBackend> backend_;
 };

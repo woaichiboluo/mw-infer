@@ -1,7 +1,7 @@
-#include <stdexcept>
 #include <utility>
 
 #include "runtime/backends/backend_registry.h"
+#include "runtime/backends/onnx_runtime_session.h"
 
 namespace mw::infer {
 
@@ -9,17 +9,21 @@ namespace {
 
 class OnnxCpuBackend final : public IBackend {
  public:
-  explicit OnnxCpuBackend(RuntimeConfig config) : config_(std::move(config)) {}
+  explicit OnnxCpuBackend(RuntimeConfig config)
+      : session_(std::move(config), false) {}
 
   BackendKind kind() const override { return BackendKind::kOnnxCpu; }
 
-  InferenceResult Forward(const std::vector<Tensor>& inputs) override {
-    (void)inputs;
-    throw std::runtime_error("OnnxCpuBackend forward is not implemented yet");
+  const InferOutputs& InferBatch(const std::vector<cv::Mat>& inputs) override {
+    return session_.Infer(inputs);
+  }
+
+  std::unique_ptr<IBackend> Clone() const override {
+    return std::make_unique<OnnxCpuBackend>(session_.config());
   }
 
  private:
-  RuntimeConfig config_;
+  OnnxRuntimeSession session_;
 };
 
 }  // namespace
