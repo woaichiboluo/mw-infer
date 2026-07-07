@@ -9,34 +9,83 @@ else()
   find_package(GTest 1.17.0 REQUIRED)
 endif()
 
-add_executable(mw_infer_runtime_config_test runtime_config_test.cc)
-target_link_libraries(mw_infer_runtime_config_test PRIVATE MwInfer::Runtime
-                                                           GTest::gtest_main)
+add_executable(mw_infer_input_test input_test.cpp)
+target_link_libraries(mw_infer_input_test PRIVATE MwInfer::Runtime
+                                                  GTest::gtest_main)
 
-add_executable(mw_infer_pipeline_test pipeline_test.cc)
-target_link_libraries(mw_infer_pipeline_test PRIVATE MwInfer::Runtime
-                                                     GTest::gtest_main)
-
-add_executable(mw_infer_blocks_test blocks_test.cc)
-target_link_libraries(mw_infer_blocks_test PRIVATE MwInfer::Runtime
+add_executable(mw_infer_tensor_test tensor_test.cpp)
+target_link_libraries(mw_infer_tensor_test PRIVATE MwInfer::Common
                                                    GTest::gtest_main)
 
-add_executable(mw_infer_opencv_blocks_test opencv_blocks_test.cc)
-target_link_libraries(mw_infer_opencv_blocks_test PRIVATE MwInfer::Runtime
-                                                          GTest::gtest_main)
+add_executable(mw_infer_geometry_test geometry_test.cpp)
+target_link_libraries(mw_infer_geometry_test PRIVATE MwInfer::Runtime
+                                                     GTest::gtest_main)
 
-if(MW_INFER_WITH_ONNXRUNTIME)
-  add_executable(mw_infer_onnx_infer_test onnx_infer_test.cc)
-  target_link_libraries(mw_infer_onnx_infer_test PRIVATE MwInfer::Runtime
-                                                         GTest::gtest_main)
+if(TARGET MwInfer::OpenCVAdapter)
+  add_executable(mw_infer_opencv_input_test opencv_input_test.cpp)
+  target_link_libraries(mw_infer_opencv_input_test
+                        PRIVATE MwInfer::OpenCVAdapter GTest::gtest_main)
+
+  add_executable(mw_infer_opencv_geometry_test opencv_geometry_test.cpp)
+  target_link_libraries(mw_infer_opencv_geometry_test
+                        PRIVATE MwInfer::OpenCVAdapter GTest::gtest_main)
+endif()
+
+if(TARGET MwInfer::OpenCVCudaAdapter)
+  add_executable(mw_infer_opencv_cuda_input_test opencv_cuda_input_test.cpp)
+  target_link_libraries(mw_infer_opencv_cuda_input_test
+                        PRIVATE MwInfer::OpenCVCudaAdapter GTest::gtest_main)
+
+  add_executable(mw_infer_opencv_cuda_geometry_test
+                 opencv_cuda_geometry_test.cpp)
+  target_link_libraries(mw_infer_opencv_cuda_geometry_test
+                        PRIVATE MwInfer::OpenCVCudaAdapter GTest::gtest_main)
+endif()
+
+if(TARGET MwInfer::OnnxRuntimeBackends)
+  add_executable(mw_infer_onnx_runtime_backends_test
+                 onnx_runtime_backend_test.cpp)
+  target_link_libraries(mw_infer_onnx_runtime_backends_test
+                        PRIVATE MwInfer::OnnxRuntimeBackends GTest::gtest_main)
+endif()
+
+if(TARGET MwInfer::CudaTensor)
+  add_executable(mw_infer_cuda_tensor_test cuda_tensor_test.cpp)
+  target_link_libraries(mw_infer_cuda_tensor_test
+                        PRIVATE MwInfer::CudaTensor GTest::gtest_main)
 endif()
 
 include(GoogleTest)
-gtest_discover_tests(mw_infer_runtime_config_test)
-gtest_discover_tests(mw_infer_pipeline_test)
-gtest_discover_tests(mw_infer_blocks_test)
-gtest_discover_tests(mw_infer_opencv_blocks_test)
 
-if(MW_INFER_WITH_ONNXRUNTIME)
-  gtest_discover_tests(mw_infer_onnx_infer_test)
+set(_MW_INFER_GTEST_DISCOVERY_TIMEOUT 30)
+
+gtest_discover_tests(mw_infer_input_test DISCOVERY_TIMEOUT
+                     ${_MW_INFER_GTEST_DISCOVERY_TIMEOUT})
+gtest_discover_tests(mw_infer_tensor_test DISCOVERY_TIMEOUT
+                     ${_MW_INFER_GTEST_DISCOVERY_TIMEOUT})
+gtest_discover_tests(mw_infer_geometry_test DISCOVERY_TIMEOUT
+                     ${_MW_INFER_GTEST_DISCOVERY_TIMEOUT})
+
+if(TARGET MwInfer::OpenCVAdapter)
+  gtest_discover_tests(mw_infer_opencv_input_test DISCOVERY_TIMEOUT
+                       ${_MW_INFER_GTEST_DISCOVERY_TIMEOUT})
+  gtest_discover_tests(mw_infer_opencv_geometry_test DISCOVERY_TIMEOUT
+                       ${_MW_INFER_GTEST_DISCOVERY_TIMEOUT})
+endif()
+
+if(TARGET MwInfer::OpenCVCudaAdapter)
+  gtest_discover_tests(mw_infer_opencv_cuda_input_test DISCOVERY_TIMEOUT
+                       ${_MW_INFER_GTEST_DISCOVERY_TIMEOUT})
+  gtest_discover_tests(mw_infer_opencv_cuda_geometry_test DISCOVERY_TIMEOUT
+                       ${_MW_INFER_GTEST_DISCOVERY_TIMEOUT})
+endif()
+
+if(TARGET MwInfer::OnnxRuntimeBackends)
+  gtest_discover_tests(mw_infer_onnx_runtime_backends_test DISCOVERY_TIMEOUT
+                       ${_MW_INFER_GTEST_DISCOVERY_TIMEOUT})
+endif()
+
+if(TARGET MwInfer::CudaTensor)
+  gtest_discover_tests(mw_infer_cuda_tensor_test DISCOVERY_TIMEOUT
+                       ${_MW_INFER_GTEST_DISCOVERY_TIMEOUT})
 endif()
