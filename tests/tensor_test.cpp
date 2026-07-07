@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 
-#include "mw/infer/common/tensor_allocator.h"
+#include "mw/infer/runtime/tensor/tensor_allocator.h"
 
 namespace mw::infer {
 namespace {

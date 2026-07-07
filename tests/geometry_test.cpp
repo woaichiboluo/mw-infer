@@ -1,11 +1,11 @@
+#include "mw/infer/runtime/process/geometry.h"
+
 #include <gtest/gtest.h>
 
 #include <cstddef>
 #include <string>
 #include <utility>
 #include <vector>
-
-#include "mw/infer/runtime/image_batch.h"
 
 namespace mw::infer {
 namespace {
@@ -28,17 +28,16 @@ RawImage MakeTestImage(std::string name, ImageSize size) {
                               TestImageHandle{std::move(name)});
 }
 
-TEST(ImageBatchTest, WrapsRawImageBatch) {
+TEST(GeometryResultTest, WrapsRawImageBatch) {
   RawImageBatch raw_images({MakeTestImage("a", ImageSize{20, 10}),
                             MakeTestImage("b", ImageSize{30, 15})});
 
-  ImageBatch batch(raw_images);
+  GeometryResult result(raw_images);
 
-  ASSERT_EQ(batch.size(), 2U);
-  EXPECT_EQ(batch.frame(0).image.size().width, 20);
-  EXPECT_EQ(batch.frame(0).original_desc.size.width, 20);
-  EXPECT_TRUE(batch.frame(0).geometry_trace.empty());
-  EXPECT_EQ(batch.ToRawImageBatch().size(), 2U);
+  ASSERT_EQ(result.size(), 2U);
+  EXPECT_EQ(result.images().image(0).size().width, 20);
+  EXPECT_TRUE(result.trace(0).empty());
+  EXPECT_EQ(result.images().size(), 2U);
 }
 
 TEST(GeometryTraceTest, RestoresPointThroughResizeAndCrop) {

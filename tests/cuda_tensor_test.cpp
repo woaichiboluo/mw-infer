@@ -1,4 +1,4 @@
-#include "mw/infer/runtime/cuda_tensor.h"
+#include "mw/infer/runtime/tensor/cuda_tensor.h"
 
 #include <cuda_runtime_api.h>
 #include <gtest/gtest.h>

@@ -1,4 +1,4 @@
-#include "mw/infer/runtime/adapters/opencv_input.h"
+#include "mw/infer/runtime/input/opencv_input.h"
 
 #include <gtest/gtest.h>
 

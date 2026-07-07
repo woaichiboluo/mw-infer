@@ -1,4 +1,4 @@
-#include "mw/infer/runtime/input.h"
+#include "mw/infer/runtime/input/input.h"
 
 #include <gtest/gtest.h>
 

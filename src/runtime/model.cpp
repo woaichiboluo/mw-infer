@@ -1,41 +1,12 @@
-#ifndef MW_INFER_COMMON_MODEL_H_
-#define MW_INFER_COMMON_MODEL_H_
+#include "mw/infer/runtime/model.h"
 
 #include <cctype>
-#include <cstddef>
-#include <filesystem>
-#include <memory>
 #include <stdexcept>
-#include <string>
 #include <utility>
 
 namespace mw::infer {
 
-enum class ModelFormat {
-  kOnnx,
-  kTensorRT,
-};
-
-enum class ModelSourceKind {
-  kPath,
-  kMemory,
-};
-
-struct ModelSource {
-  ModelSourceKind kind = ModelSourceKind::kPath;
-  std::filesystem::path path;
-  const void* data = nullptr;
-  std::size_t bytes = 0;
-  std::shared_ptr<const void> owner;
-};
-
-struct Model {
-  ModelFormat format = ModelFormat::kOnnx;
-  ModelSource source;
-  std::string name;
-};
-
-inline ModelSource ModelSourceFromPath(std::filesystem::path path) {
+ModelSource ModelSourceFromPath(std::filesystem::path path) {
   if (path.empty()) {
     throw std::invalid_argument("Model path is empty");
   }
@@ -46,9 +17,8 @@ inline ModelSource ModelSourceFromPath(std::filesystem::path path) {
   return source;
 }
 
-inline ModelSource ModelSourceFromMemory(
-    const void* data, std::size_t bytes,
-    std::shared_ptr<const void> owner = nullptr) {
+ModelSource ModelSourceFromMemory(const void* data, std::size_t bytes,
+                                  std::shared_ptr<const void> owner) {
   if (data == nullptr) {
     throw std::invalid_argument("Model memory data is null");
   }
@@ -64,7 +34,7 @@ inline ModelSource ModelSourceFromMemory(
   return source;
 }
 
-inline ModelFormat InferModelFormatFromPath(const std::filesystem::path& path) {
+ModelFormat InferModelFormatFromPath(const std::filesystem::path& path) {
   std::string extension = path.extension().string();
   for (char& character : extension) {
     character =
@@ -81,7 +51,7 @@ inline ModelFormat InferModelFormatFromPath(const std::filesystem::path& path) {
   throw std::invalid_argument("Unsupported model file extension: " + extension);
 }
 
-inline Model ModelFromPath(std::filesystem::path path) {
+Model ModelFromPath(std::filesystem::path path) {
   Model model;
   model.format = InferModelFormatFromPath(path);
   model.name = path.stem().string();
@@ -89,10 +59,8 @@ inline Model ModelFromPath(std::filesystem::path path) {
   return model;
 }
 
-inline Model ModelFromMemory(ModelFormat format, const void* data,
-                             std::size_t bytes,
-                             std::shared_ptr<const void> owner = nullptr,
-                             std::string name = {}) {
+Model ModelFromMemory(ModelFormat format, const void* data, std::size_t bytes,
+                      std::shared_ptr<const void> owner, std::string name) {
   Model model;
   model.format = format;
   model.source = ModelSourceFromMemory(data, bytes, std::move(owner));
@@ -101,5 +69,3 @@ inline Model ModelFromMemory(ModelFormat format, const void* data,
 }
 
 }  // namespace mw::infer
-
-#endif  // MW_INFER_COMMON_MODEL_H_
