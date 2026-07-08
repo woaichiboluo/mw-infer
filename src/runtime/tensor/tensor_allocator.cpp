@@ -1,10 +1,87 @@
 #include "mw/infer/runtime/tensor/tensor_allocator.h"
 
+#if defined(MW_INFER_HAS_CUDA_RUNTIME)
+#include <cuda_runtime_api.h>
+#endif
+
+#include <cstring>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace mw::infer {
+
+namespace {
+
+#if defined(MW_INFER_HAS_CUDA_RUNTIME)
+std::string CudaErrorMessage(cudaError_t status, const char* operation) {
+  return std::string(operation) + " failed: " + cudaGetErrorString(status);
+}
+
+void CheckCuda(cudaError_t status, const char* operation) {
+  if (status != cudaSuccess) {
+    throw std::runtime_error(CudaErrorMessage(status, operation));
+  }
+}
+#endif
+
+void CopyTensorBytes(const Tensor& source, Tensor* target) {
+  if (source.bytes() != target->bytes()) {
+    throw std::invalid_argument("Tensor copy byte size mismatch");
+  }
+
+  const Device source_device = source.device();
+  const Device target_device = target->device();
+  if (source_device.type == DeviceType::kCpu &&
+      target_device.type == DeviceType::kCpu) {
+    std::memcpy(target->data(), source.data(), source.bytes());
+    return;
+  }
+
+#if defined(MW_INFER_HAS_CUDA_RUNTIME)
+  if (source_device.type == DeviceType::kCpu &&
+      target_device.type == DeviceType::kCuda) {
+    CheckCuda(cudaSetDevice(target_device.id), "cudaSetDevice");
+    CheckCuda(cudaMemcpy(target->data(), source.data(), source.bytes(),
+                         cudaMemcpyHostToDevice),
+              "cudaMemcpy");
+    return;
+  }
+  if (source_device.type == DeviceType::kCuda &&
+      target_device.type == DeviceType::kCpu) {
+    CheckCuda(cudaSetDevice(source_device.id), "cudaSetDevice");
+    CheckCuda(cudaMemcpy(target->data(), source.data(), source.bytes(),
+                         cudaMemcpyDeviceToHost),
+              "cudaMemcpy");
+    return;
+  }
+  if (source_device.type == DeviceType::kCuda &&
+      target_device.type == DeviceType::kCuda) {
+    if (source_device.id == target_device.id) {
+      CheckCuda(cudaSetDevice(target_device.id), "cudaSetDevice");
+      CheckCuda(cudaMemcpy(target->data(), source.data(), source.bytes(),
+                           cudaMemcpyDeviceToDevice),
+                "cudaMemcpy");
+      return;
+    }
+
+    CheckCuda(cudaMemcpyPeer(target->data(), target_device.id, source.data(),
+                             source_device.id, source.bytes()),
+              "cudaMemcpyPeer");
+    return;
+  }
+#else
+  if (source_device.type == DeviceType::kCuda ||
+      target_device.type == DeviceType::kCuda) {
+    throw std::runtime_error("CUDA tensor copy is unavailable in this build");
+  }
+#endif
+
+  throw std::invalid_argument("Tensor copy device is unsupported");
+}
+
+}  // namespace
 
 std::unique_ptr<TensorAllocationAdapter> CreateHostTensorAllocationAdapter();
 
@@ -65,6 +142,18 @@ Tensor Tensor::Allocate(TensorDesc desc) {
 
 Tensor Tensor::Allocate(TensorDesc desc, const TensorAllocator& allocator) {
   return allocator.Allocate(std::move(desc));
+}
+
+Tensor Tensor::CopyTo(Device target_device) const {
+  if (empty()) {
+    throw std::invalid_argument("Cannot copy an empty tensor");
+  }
+
+  TensorDesc target_desc = desc_;
+  target_desc.device = target_device;
+  Tensor target = Tensor::Allocate(std::move(target_desc));
+  CopyTensorBytes(*this, &target);
+  return target;
 }
 
 TensorBuffer::TensorBuffer(TensorAllocator allocator)

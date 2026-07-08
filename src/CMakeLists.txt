@@ -1,10 +1,15 @@
 add_library(MwInferRuntime STATIC runtime/backend/backend.cpp
                                  runtime/backend/model.cpp
+                                 runtime/tensor/gather.cpp
                                  runtime/tensor/host_tensor_allocator.cpp
                                  runtime/tensor/tensor_allocator.cpp
+                                 runtime/process/channel.cpp
                                  runtime/process/geometry.cpp
                                  runtime/process/image_to_tensor.cpp
-                                 runtime/postprocess/nms.cpp)
+                                 runtime/process/normalize.cpp
+                                 runtime/postprocess/nms.cpp
+                                 runtime/postprocess/softmax.cpp
+                                 runtime/postprocess/topk.cpp)
 add_library(MwInfer::Runtime ALIAS MwInferRuntime)
 
 set_target_properties(MwInferRuntime PROPERTIES EXPORT_NAME Runtime)
@@ -35,6 +40,19 @@ set(MW_INFER_DEPENDENCY_CUDATOOLKIT_STATUS "not found" PARENT_SCOPE)
 
 set(MW_INFER_CUDA_LANGUAGE_AVAILABLE FALSE)
 if(TARGET CUDA::cudart)
+  if(WIN32 AND MSVC)
+    set(MW_INFER_CUDA_MSVC_FLAGS "--allow-unsupported-compiler"
+                                 "--forward-slash-prefix-opts")
+    foreach(cuda_msvc_flag IN LISTS MW_INFER_CUDA_MSVC_FLAGS)
+      foreach(flag_var CMAKE_CUDA_FLAGS CMAKE_CUDA_FLAGS_INIT)
+        if(NOT "${${flag_var}}" MATCHES
+               "(^|[ ;])${cuda_msvc_flag}([ ;]|$)")
+          string(APPEND ${flag_var} " ${cuda_msvc_flag}")
+        endif()
+      endforeach()
+    endforeach()
+  endif()
+
   if(CUDAToolkit_NVCC_EXECUTABLE AND NOT CMAKE_CUDA_COMPILER)
     set(CMAKE_CUDA_COMPILER
         "${CUDAToolkit_NVCC_EXECUTABLE}"
@@ -101,16 +119,27 @@ if(TARGET CUDA::cudart)
   target_sources(MwInferRuntime
                  PRIVATE runtime/tensor/cuda_tensor_allocator.cpp)
   target_compile_definitions(MwInferRuntime
+                             PUBLIC MW_INFER_HAS_CUDA_RUNTIME=1
                              PRIVATE MW_INFER_HAS_CUDA_TENSOR_ADAPTER=1)
   target_link_libraries(MwInferRuntime PUBLIC CUDA::cudart)
 
   if(MW_INFER_CUDA_LANGUAGE_AVAILABLE)
-    set(MW_INFER_FEATURE_CUDA_NMS_STATUS "enabled" PARENT_SCOPE)
+    set(MW_INFER_FEATURE_CUDA_TENSOR_OPS_STATUS "enabled" PARENT_SCOPE)
+    set(MW_INFER_FEATURE_CUDA_PREPROCESS_STATUS "enabled" PARENT_SCOPE)
+    set(MW_INFER_FEATURE_CUDA_POSTPROCESS_STATUS "enabled" PARENT_SCOPE)
     set_target_properties(
       MwInferRuntime PROPERTIES CUDA_ARCHITECTURES
                                 "${MW_INFER_CUDA_ARCHITECTURES}")
-    target_sources(MwInferRuntime PRIVATE runtime/postprocess/cuda_nms.cu)
-    target_compile_definitions(MwInferRuntime PUBLIC MW_INFER_HAS_CUDA_NMS=1)
+    target_sources(MwInferRuntime PRIVATE runtime/tensor/gather.cu
+                                          runtime/process/channel.cu
+                                          runtime/process/normalize.cu
+                                          runtime/postprocess/nms.cu
+                                          runtime/postprocess/softmax.cu
+                                          runtime/postprocess/topk.cu)
+    target_compile_definitions(MwInferRuntime
+                               PUBLIC MW_INFER_HAS_CUDA_PREPROCESS=1
+                                      MW_INFER_HAS_CUDA_POSTPROCESS=1
+                                      MW_INFER_HAS_CUDA_TENSOR_OPS=1)
     set_target_properties(MwInferRuntime
                           PROPERTIES CUDA_STANDARD 17
                                      CUDA_STANDARD_REQUIRED ON)

@@ -9,10 +9,8 @@
 
 #include "mw/infer/runtime/tensor/tensor_allocator.h"
 
-#if defined(MW_INFER_HAS_CUDA_NMS)
+#if defined(MW_INFER_HAS_CUDA_POSTPROCESS)
 #include <cuda_runtime_api.h>
-
-#include "mw/infer/runtime/postprocess/cuda_nms.h"
 #endif
 
 namespace mw::infer {
@@ -37,6 +35,13 @@ std::vector<int64_t> CopyCpuIndices(const Tensor& tensor) {
   return std::vector<int64_t>(data, data + tensor.element_count());
 }
 
+std::vector<float> CopyCpuFloats(const Tensor& tensor) {
+  EXPECT_EQ(tensor.device().type, DeviceType::kCpu);
+  EXPECT_EQ(tensor.data_type(), DataType::kFloat32);
+  const auto* data = static_cast<const float*>(tensor.data());
+  return std::vector<float>(data, data + tensor.element_count());
+}
+
 std::vector<float> TestBoxes() {
   return {
       0.0F,  0.0F,  10.0F, 10.0F,  //
@@ -47,18 +52,18 @@ std::vector<float> TestBoxes() {
 
 std::vector<float> TestScores() { return {0.9F, 0.8F, 0.7F}; }
 
-TEST(NmsTest, CpuNmsSuppressesOverlappingBoxes) {
+TEST(NmsTest, SuppressesOverlappingBoxes) {
   Tensor boxes = MakeCpuTensor({3, 4}, TestBoxes(), "boxes");
   Tensor scores = MakeCpuTensor({3}, TestScores(), "scores");
 
-  Tensor keep = CpuNms(boxes, scores, 0.5F);
+  Tensor keep = Nms(boxes, scores, 0.5F);
 
   EXPECT_EQ(keep.name(), "nms_indices");
   EXPECT_EQ(keep.shape(), std::vector<int64_t>({2}));
   EXPECT_EQ(CopyCpuIndices(keep), std::vector<int64_t>({0, 2}));
 }
 
-TEST(NmsTest, DispatchesCpuNmsByInputDevice) {
+TEST(NmsTest, DispatchesHostTensorByInputDevice) {
   Tensor boxes = MakeCpuTensor({3, 4}, TestBoxes(), "boxes");
   Tensor scores = MakeCpuTensor({3}, TestScores(), "scores");
 
@@ -70,31 +75,41 @@ TEST(NmsTest, DispatchesCpuNmsByInputDevice) {
 TEST(NmsTest, RespectsMaxOutputBoxes) {
   Tensor boxes = MakeCpuTensor({3, 4}, TestBoxes(), "boxes");
   Tensor scores = MakeCpuTensor({3}, TestScores(), "scores");
-  NmsOptions options;
-  options.iou_threshold = 0.5F;
-  options.max_output_boxes = 1;
-
-  Tensor keep = CpuNms(boxes, scores, options);
+  Tensor keep = Nms(boxes, scores, 0.5F, 0.0F, 1);
 
   EXPECT_EQ(keep.shape(), std::vector<int64_t>({1}));
   EXPECT_EQ(CopyCpuIndices(keep), std::vector<int64_t>({0}));
+}
+
+TEST(NmsTest, IndicesGatherSelectedRows) {
+  Tensor boxes = MakeCpuTensor({3, 4}, TestBoxes(), "boxes");
+  Tensor scores = MakeCpuTensor({3}, TestScores(), "scores");
+
+  Tensor keep = Nms(boxes, scores, 0.5F);
+  Tensor selected_boxes = boxes.GatherRows(keep);
+  Tensor selected_scores = scores.GatherRows(keep);
+
+  EXPECT_EQ(selected_boxes.shape(), std::vector<int64_t>({2, 4}));
+  EXPECT_EQ(selected_scores.shape(), std::vector<int64_t>({2}));
+  EXPECT_EQ(CopyCpuFloats(selected_boxes),
+            std::vector<float>(
+                {0.0F, 0.0F, 10.0F, 10.0F, 20.0F, 20.0F, 30.0F, 30.0F}));
+  EXPECT_EQ(CopyCpuFloats(selected_scores), std::vector<float>({0.9F, 0.7F}));
 }
 
 TEST(NmsTest, RejectsInvalidInputs) {
   Tensor boxes = MakeCpuTensor({3, 4}, TestBoxes(), "boxes");
   Tensor scores = MakeCpuTensor({3}, TestScores(), "scores");
 
-  NmsOptions options;
-  options.iou_threshold = -0.1F;
-  EXPECT_THROW(static_cast<void>(CpuNms(boxes, scores, options)),
+  EXPECT_THROW(static_cast<void>(Nms(boxes, scores, -0.1F)),
                std::invalid_argument);
 
   Tensor bad_scores = MakeCpuTensor({2}, {0.9F, 0.8F}, "scores");
-  EXPECT_THROW(static_cast<void>(CpuNms(boxes, bad_scores, 0.5F)),
+  EXPECT_THROW(static_cast<void>(Nms(boxes, bad_scores, 0.5F)),
                std::invalid_argument);
 }
 
-#if defined(MW_INFER_HAS_CUDA_NMS)
+#if defined(MW_INFER_HAS_CUDA_POSTPROCESS)
 
 bool HasUsableCudaDevice() {
   int count = 0;
@@ -125,26 +140,25 @@ std::vector<int64_t> CopyCudaIndices(const Tensor& tensor) {
   return values;
 }
 
-TEST(NmsTest, CudaNmsSuppressesOverlappingBoxes) {
+TEST(NmsTest, DispatchesCudaTensor) {
   if (!HasUsableCudaDevice()) {
-    GTEST_SKIP() << "CUDA NMS is unavailable";
+    GTEST_SKIP() << "CUDA postprocess is unavailable";
   }
   ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
 
   Tensor boxes = MakeCudaTensor({3, 4}, TestBoxes(), "boxes");
   Tensor scores = MakeCudaTensor({3}, TestScores(), "scores");
 
-  Tensor keep = CudaNms(boxes, scores, 0.5F);
+  Tensor keep = Nms(boxes, scores, 0.5F);
 
-  EXPECT_TRUE(CudaNmsAvailable());
   EXPECT_EQ(keep.name(), "nms_indices");
   EXPECT_EQ(keep.shape(), std::vector<int64_t>({2}));
   EXPECT_EQ(CopyCudaIndices(keep), std::vector<int64_t>({0, 2}));
 }
 
-TEST(NmsTest, DispatchesCudaNmsByInputDevice) {
+TEST(NmsTest, DispatchesDeviceTensorByInputDevice) {
   if (!HasUsableCudaDevice()) {
-    GTEST_SKIP() << "CUDA NMS is unavailable";
+    GTEST_SKIP() << "CUDA postprocess is unavailable";
   }
   ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
 

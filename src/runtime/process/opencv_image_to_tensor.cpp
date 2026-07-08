@@ -81,23 +81,67 @@ std::byte* TensorBytes(Tensor* tensor) {
   return static_cast<std::byte*>(tensor->data());
 }
 
+int RgbSourceChannel(PixelFormat pixel_format, int channel) {
+  switch (pixel_format) {
+    case PixelFormat::kBgr:
+    case PixelFormat::kBgra:
+      if (channel == 0) {
+        return 2;
+      }
+      if (channel == 2) {
+        return 0;
+      }
+      return channel;
+    case PixelFormat::kUnknown:
+    case PixelFormat::kRgb:
+    case PixelFormat::kRgba:
+    case PixelFormat::kGray:
+    case PixelFormat::kNv12:
+    case PixelFormat::kNv21:
+      return channel;
+  }
+  return channel;
+}
+
+bool NeedsRgbChannelOrder(PixelFormat pixel_format) {
+  return pixel_format == PixelFormat::kBgr ||
+         pixel_format == PixelFormat::kBgra;
+}
+
 cv::Mat ConvertImage(const cv::Mat& image, int output_type) {
   cv::Mat converted;
   image.convertTo(converted, output_type);
   return converted;
 }
 
-void CopyToBhwc(const cv::Mat& image, Tensor* output, std::size_t batch_index) {
+void CopyToBhwc(const cv::Mat& image, PixelFormat pixel_format, Tensor* output,
+                std::size_t batch_index) {
   const std::size_t image_bytes = static_cast<std::size_t>(image.rows) *
                                   image.cols * image.channels() *
                                   ElementSize(output->data_type());
   cv::Mat output_view(image.rows, image.cols,
                       TensorImageType(*output, image.channels()),
                       TensorBytes(output) + batch_index * image_bytes);
-  image.convertTo(output_view, output_view.type());
+  if (!NeedsRgbChannelOrder(pixel_format)) {
+    image.convertTo(output_view, output_view.type());
+    return;
+  }
+
+  cv::Mat converted = ConvertImage(image, output_view.type());
+  std::vector<cv::Mat> source_planes;
+  cv::split(converted, source_planes);
+
+  std::vector<cv::Mat> target_planes;
+  target_planes.reserve(static_cast<std::size_t>(image.channels()));
+  for (int channel = 0; channel < image.channels(); ++channel) {
+    target_planes.push_back(source_planes[static_cast<std::size_t>(
+        RgbSourceChannel(pixel_format, channel))]);
+  }
+  cv::merge(target_planes, output_view);
 }
 
-void CopyToBchw(const cv::Mat& image, Tensor* output, std::size_t batch_index) {
+void CopyToBchw(const cv::Mat& image, PixelFormat pixel_format, Tensor* output,
+                std::size_t batch_index) {
   const int channels = image.channels();
   const std::size_t plane_elements =
       static_cast<std::size_t>(image.rows) * image.cols;
@@ -116,7 +160,18 @@ void CopyToBchw(const cv::Mat& image, Tensor* output, std::size_t batch_index) {
   }
 
   cv::Mat converted = ConvertImage(image, TensorImageType(*output, channels));
-  cv::split(converted, planes);
+  if (!NeedsRgbChannelOrder(pixel_format)) {
+    cv::split(converted, planes);
+    return;
+  }
+
+  std::vector<cv::Mat> source_planes;
+  cv::split(converted, source_planes);
+  for (int channel = 0; channel < channels; ++channel) {
+    source_planes[static_cast<std::size_t>(
+                      RgbSourceChannel(pixel_format, channel))]
+        .copyTo(planes[static_cast<std::size_t>(channel)]);
+  }
 }
 
 class OpenCvImageToTensorAdapter final : public ImageToTensorAdapter {
@@ -148,13 +203,14 @@ class OpenCvImageToTensorAdapter final : public ImageToTensorAdapter {
     const std::vector<RawImage>& batch = images.images();
     for (std::size_t batch_index = 0; batch_index < batch.size();
          ++batch_index) {
-      const cv::Mat& image = GetOpenCvMat(batch[batch_index]);
+      const RawImage& raw_image = batch[batch_index];
+      const cv::Mat& image = GetOpenCvMat(raw_image);
       switch (layout) {
         case TensorLayout::kBchw:
-          CopyToBchw(image, output, batch_index);
+          CopyToBchw(image, raw_image.pixel_format(), output, batch_index);
           break;
         case TensorLayout::kBhwc:
-          CopyToBhwc(image, output, batch_index);
+          CopyToBhwc(image, raw_image.pixel_format(), output, batch_index);
           break;
       }
     }

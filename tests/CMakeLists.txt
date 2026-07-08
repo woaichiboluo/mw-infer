@@ -25,16 +25,37 @@ function(mw_infer_add_gtest target source label)
                        PROPERTIES LABELS ${label})
 endfunction()
 
+function(mw_infer_copy_onnxruntime_dlls target)
+  if(WIN32 AND ONNXRUNTIME_DIR)
+    file(GLOB _MW_INFER_ONNXRUNTIME_DLLS
+         "${ONNXRUNTIME_DIR}/lib/onnxruntime*.dll")
+    if(_MW_INFER_ONNXRUNTIME_DLLS)
+      add_custom_command(
+        TARGET ${target}
+        POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${_MW_INFER_ONNXRUNTIME_DLLS} $<TARGET_FILE_DIR:${target}>)
+    endif()
+  endif()
+endfunction()
+
 mw_infer_add_gtest(mw_infer_model_test runtime/backend/model_test.cpp
                    runtime_backend)
 mw_infer_add_gtest(mw_infer_input_test runtime/input/input_test.cpp
                    runtime_input)
 mw_infer_add_gtest(mw_infer_tensor_test runtime/tensor/tensor_test.cpp
                    runtime_tensor)
+mw_infer_add_gtest(mw_infer_gather_test runtime/tensor/gather_test.cpp
+                   runtime_tensor)
 mw_infer_add_gtest(mw_infer_geometry_test runtime/process/geometry_test.cpp
                    runtime_process)
 mw_infer_add_gtest(mw_infer_image_to_tensor_test
                    runtime/process/image_to_tensor_test.cpp runtime_process)
+mw_infer_add_gtest(mw_infer_preprocess_test
+                   runtime/process/preprocess_test.cpp runtime_process)
+mw_infer_add_gtest(mw_infer_classification_postprocess_test
+                   runtime/postprocess/classification_test.cpp
+                   runtime_postprocess)
 mw_infer_add_gtest(mw_infer_nms_test runtime/postprocess/nms_test.cpp
                    runtime_postprocess)
 
@@ -66,6 +87,7 @@ endif()
 if(MW_INFER_FEATURE_ONNXRUNTIME_BACKEND_STATUS STREQUAL "enabled")
   mw_infer_add_gtest(mw_infer_onnx_backend_test
                      runtime/backend/onnx_backend_test.cpp runtime_backend)
+  mw_infer_copy_onnxruntime_dlls(mw_infer_onnx_backend_test)
 endif()
 
 if(MW_INFER_FEATURE_CUDA_TENSOR_STATUS STREQUAL "enabled")

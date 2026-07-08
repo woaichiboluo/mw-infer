@@ -1,9 +1,5 @@
 #include "mw/infer/runtime/postprocess/nms.h"
 
-#if defined(MW_INFER_HAS_CUDA_NMS)
-#include "mw/infer/runtime/postprocess/cuda_nms.h"
-#endif
-
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -11,26 +7,27 @@
 #include <numeric>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
+
+#include "nms_internal.h"
 
 namespace mw::infer {
 
-#if defined(MW_INFER_HAS_CUDA_NMS)
-Tensor RunCudaNms(const Tensor& boxes, const Tensor& scores,
-                  NmsOptions options);
-#endif
-
 namespace {
 
-void ValidateOptions(NmsOptions options) {
-  if (!std::isfinite(options.iou_threshold) || options.iou_threshold < 0.0F ||
-      options.iou_threshold > 1.0F) {
+using postprocess_internal::NmsParameters;
+
+void ValidateParameters(NmsParameters parameters) {
+  if (!std::isfinite(parameters.iou_threshold) ||
+      parameters.iou_threshold < 0.0F || parameters.iou_threshold > 1.0F) {
     throw std::invalid_argument("NMS IoU threshold must be in [0, 1]");
   }
-  if (!std::isfinite(options.coordinate_offset) ||
-      options.coordinate_offset < 0.0F) {
+  if (!std::isfinite(parameters.coordinate_offset) ||
+      parameters.coordinate_offset < 0.0F) {
     throw std::invalid_argument("NMS coordinate offset must be non-negative");
   }
-  if (options.max_output_boxes < 0) {
+  if (parameters.max_output_boxes < 0) {
     throw std::invalid_argument("NMS max output boxes must be non-negative");
   }
 }
@@ -116,15 +113,8 @@ Tensor MakeIndexTensor(std::vector<int64_t> indices, Device device) {
   return output;
 }
 
-}  // namespace
-
-Tensor CpuNms(const Tensor& boxes, const Tensor& scores, NmsOptions options) {
-  ValidateOptions(options);
-  ValidateInputs(boxes, scores);
-  if (boxes.device().type != DeviceType::kCpu) {
-    throw std::invalid_argument("CPU NMS requires CPU tensors");
-  }
-
+Tensor RunNmsOnHost(const Tensor& boxes, const Tensor& scores,
+                    NmsParameters parameters) {
   const std::size_t count = BoxCount(boxes);
   if (count == 0) {
     throw std::invalid_argument("NMS boxes tensor count must be positive");
@@ -137,7 +127,7 @@ Tensor CpuNms(const Tensor& boxes, const Tensor& scores, NmsOptions options) {
   std::vector<float> areas(count);
   for (std::size_t index = 0; index < count; ++index) {
     areas[index] = BoxArea(boxes_data, static_cast<int64_t>(index),
-                           options.coordinate_offset);
+                           parameters.coordinate_offset);
   }
 
   std::vector<uint8_t> suppressed(count, 0);
@@ -150,8 +140,8 @@ Tensor CpuNms(const Tensor& boxes, const Tensor& scores, NmsOptions options) {
 
     const int64_t selected = order[sorted_index];
     keep.push_back(selected);
-    if (options.max_output_boxes > 0 &&
-        keep.size() == static_cast<std::size_t>(options.max_output_boxes)) {
+    if (parameters.max_output_boxes > 0 &&
+        keep.size() == static_cast<std::size_t>(parameters.max_output_boxes)) {
       break;
     }
 
@@ -163,7 +153,7 @@ Tensor CpuNms(const Tensor& boxes, const Tensor& scores, NmsOptions options) {
 
       const int64_t candidate = order[next_index];
       if (IoU(boxes_data, areas, selected, candidate,
-              options.coordinate_offset) > options.iou_threshold) {
+              parameters.coordinate_offset) > parameters.iou_threshold) {
         suppressed[next_index] = 1;
       }
     }
@@ -171,57 +161,28 @@ Tensor CpuNms(const Tensor& boxes, const Tensor& scores, NmsOptions options) {
   return MakeIndexTensor(std::move(keep), boxes.device());
 }
 
-Tensor CpuNms(const Tensor& boxes, const Tensor& scores, float iou_threshold) {
-  NmsOptions options;
-  options.iou_threshold = iou_threshold;
-  return CpuNms(boxes, scores, options);
-}
+}  // namespace
 
-bool CudaNmsAvailable() {
-#if defined(MW_INFER_HAS_CUDA_NMS)
-  return true;
-#else
-  return false;
-#endif
-}
-
-#if defined(MW_INFER_HAS_CUDA_NMS)
-
-Tensor CudaNms(const Tensor& boxes, const Tensor& scores, NmsOptions options) {
-  ValidateOptions(options);
+Tensor Nms(const Tensor& boxes, const Tensor& scores, float iou_threshold,
+           float coordinate_offset, int64_t max_output_boxes) {
+  NmsParameters parameters;
+  parameters.iou_threshold = iou_threshold;
+  parameters.coordinate_offset = coordinate_offset;
+  parameters.max_output_boxes = max_output_boxes;
+  ValidateParameters(parameters);
   ValidateInputs(boxes, scores);
-  if (boxes.device().type != DeviceType::kCuda) {
-    throw std::invalid_argument("CUDA NMS requires CUDA tensors");
-  }
-  return RunCudaNms(boxes, scores, options);
-}
 
-Tensor CudaNms(const Tensor& boxes, const Tensor& scores, float iou_threshold) {
-  NmsOptions options;
-  options.iou_threshold = iou_threshold;
-  return CudaNms(boxes, scores, options);
-}
-
-#endif
-
-Tensor Nms(const Tensor& boxes, const Tensor& scores, NmsOptions options) {
   if (boxes.device().type == DeviceType::kCpu) {
-    return CpuNms(boxes, scores, options);
+    return RunNmsOnHost(boxes, scores, parameters);
   }
   if (boxes.device().type == DeviceType::kCuda) {
-#if defined(MW_INFER_HAS_CUDA_NMS)
-    return CudaNms(boxes, scores, options);
+#if defined(MW_INFER_HAS_CUDA_POSTPROCESS)
+    return postprocess_internal::RunNmsOnDevice(boxes, scores, parameters);
 #else
     throw std::runtime_error("CUDA NMS is unavailable in this build");
 #endif
   }
   throw std::invalid_argument("NMS tensor device is unsupported");
-}
-
-Tensor Nms(const Tensor& boxes, const Tensor& scores, float iou_threshold) {
-  NmsOptions options;
-  options.iou_threshold = iou_threshold;
-  return Nms(boxes, scores, options);
 }
 
 }  // namespace mw::infer

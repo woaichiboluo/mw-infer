@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <stdexcept>
@@ -114,6 +115,29 @@ TEST(TensorTest, CreatesViewWithinCapacity) {
   EXPECT_EQ(view.data(), tensor.data());
 }
 
+TEST(TensorTest, CopiesTensorToCpuDevice) {
+  Tensor source = Tensor::Allocate(MakeDesc());
+  auto* source_values = static_cast<float*>(source.data());
+  for (std::size_t index = 0; index < source.element_count(); ++index) {
+    source_values[index] = static_cast<float>(index);
+  }
+
+  Tensor copy = source.CopyTo(Device{DeviceType::kCpu, 0});
+
+  EXPECT_EQ(copy.name(), source.name());
+  EXPECT_EQ(copy.data_type(), source.data_type());
+  EXPECT_EQ(copy.shape(), source.shape());
+  EXPECT_EQ(copy.device().type, DeviceType::kCpu);
+  EXPECT_NE(copy.data(), source.data());
+  const auto* copy_values = static_cast<const float*>(copy.data());
+  for (std::size_t index = 0; index < copy.element_count(); ++index) {
+    EXPECT_FLOAT_EQ(copy_values[index], static_cast<float>(index));
+  }
+
+  source_values[0] = 100.0F;
+  EXPECT_FLOAT_EQ(copy_values[0], 0.0F);
+}
+
 TEST(TensorTest, TensorBufferReusesAndGrowsLikeVectorReserve) {
   TensorBuffer buffer;
 
@@ -134,6 +158,40 @@ TEST(TensorTest, TensorBufferReusesAndGrowsLikeVectorReserve) {
   EXPECT_EQ(larger.bytes(), 384U);
   EXPECT_EQ(larger.capacity_bytes(), 384U);
   EXPECT_EQ(buffer.capacity_bytes(), 384U);
+}
+
+TEST(TensorTest, TensorBufferKeepsCapacityStableAcrossLargerBatches) {
+  TensorBuffer buffer;
+
+  Tensor warmup = buffer.Ensure(MakeDescWithShape({32, 3, 2, 2}));
+  void* warmup_data = warmup.data();
+  EXPECT_EQ(warmup.bytes(), 1536U);
+  EXPECT_EQ(warmup.capacity_bytes(), 1536U);
+
+  for (int64_t batch : {1, 2, 4, 8, 16, 32}) {
+    Tensor tensor = buffer.Ensure(MakeDescWithShape({batch, 3, 2, 2}));
+    EXPECT_EQ(tensor.data(), warmup_data);
+    EXPECT_EQ(tensor.bytes(),
+              static_cast<std::size_t>(batch * 3 * 2 * 2 * sizeof(float)));
+    EXPECT_EQ(tensor.capacity_bytes(), 1536U);
+    EXPECT_EQ(buffer.capacity_bytes(), 1536U);
+  }
+
+  Tensor grown = buffer.Ensure(MakeDescWithShape({64, 3, 2, 2}));
+  void* grown_data = grown.data();
+  EXPECT_NE(grown_data, nullptr);
+  EXPECT_EQ(grown.bytes(), 3072U);
+  EXPECT_EQ(grown.capacity_bytes(), 3072U);
+  EXPECT_EQ(buffer.capacity_bytes(), 3072U);
+
+  for (int64_t batch : {48, 17, 1, 64}) {
+    Tensor tensor = buffer.Ensure(MakeDescWithShape({batch, 3, 2, 2}));
+    EXPECT_EQ(tensor.data(), grown_data);
+    EXPECT_EQ(tensor.bytes(),
+              static_cast<std::size_t>(batch * 3 * 2 * 2 * sizeof(float)));
+    EXPECT_EQ(tensor.capacity_bytes(), 3072U);
+    EXPECT_EQ(buffer.capacity_bytes(), 3072U);
+  }
 }
 
 TEST(TensorTest, TensorAllocatorRejectsUnsupportedDevice) {
@@ -220,6 +278,11 @@ TEST(TensorTest, RejectsInvalidBuffers) {
   TensorDesc cuda_desc = MakeDesc();
   cuda_desc.device = Device{DeviceType::kCuda, 0};
   EXPECT_THROW(static_cast<void>(tensor.View(cuda_desc)),
+               std::invalid_argument);
+}
+
+TEST(TensorTest, RejectsEmptyTensorCopy) {
+  EXPECT_THROW(static_cast<void>(Tensor{}.CopyTo(Device{DeviceType::kCpu, 0})),
                std::invalid_argument);
 }
 

@@ -33,6 +33,13 @@ cv::Mat MakeTestMat() {
   return image;
 }
 
+cv::Mat MakeFourChannelTestMat() {
+  cv::Mat image(1, 2, CV_8UC4);
+  image.at<cv::Vec4b>(0, 0) = cv::Vec4b(1, 2, 3, 4);
+  image.at<cv::Vec4b>(0, 1) = cv::Vec4b(5, 6, 7, 8);
+  return image;
+}
+
 std::vector<float> CopyFloatTensorToHost(const Tensor& tensor) {
   std::vector<float> values(tensor.element_count());
   EXPECT_EQ(cudaMemcpy(values.data(), tensor.data(), tensor.bytes(),
@@ -41,7 +48,7 @@ std::vector<float> CopyFloatTensorToHost(const Tensor& tensor) {
   return values;
 }
 
-TEST(OpenCvCudaImageToTensorTest, UploadsHostMatToCudaBchwTensor) {
+TEST(OpenCvCudaImageToTensorTest, UploadsBgrHostMatToRgbCudaBchwTensor) {
   if (!HasUsableCudaDevice()) {
     GTEST_SKIP() << "CUDA image-to-tensor is unavailable";
   }
@@ -57,15 +64,15 @@ TEST(OpenCvCudaImageToTensorTest, UploadsHostMatToCudaBchwTensor) {
   ASSERT_EQ(tensor.data_type(), DataType::kFloat32);
 
   const std::vector<float> values = CopyFloatTensorToHost(tensor);
-  EXPECT_FLOAT_EQ(values[0], 1.0F);
-  EXPECT_FLOAT_EQ(values[1], 4.0F);
+  EXPECT_FLOAT_EQ(values[0], 3.0F);
+  EXPECT_FLOAT_EQ(values[1], 6.0F);
   EXPECT_FLOAT_EQ(values[2], 2.0F);
   EXPECT_FLOAT_EQ(values[3], 5.0F);
-  EXPECT_FLOAT_EQ(values[4], 3.0F);
-  EXPECT_FLOAT_EQ(values[5], 6.0F);
+  EXPECT_FLOAT_EQ(values[4], 1.0F);
+  EXPECT_FLOAT_EQ(values[5], 4.0F);
 }
 
-TEST(OpenCvCudaImageToTensorTest, ConvertsGpuMatToCudaBhwcTensor) {
+TEST(OpenCvCudaImageToTensorTest, ConvertsBgrGpuMatToRgbCudaBhwcTensor) {
   if (!HasUsableCudaDevice()) {
     GTEST_SKIP() << "CUDA image-to-tensor is unavailable";
   }
@@ -83,12 +90,40 @@ TEST(OpenCvCudaImageToTensorTest, ConvertsGpuMatToCudaBhwcTensor) {
   ASSERT_EQ(tensor.data_type(), DataType::kFloat32);
 
   const std::vector<float> values = CopyFloatTensorToHost(tensor);
-  EXPECT_FLOAT_EQ(values[0], 1.0F);
+  EXPECT_FLOAT_EQ(values[0], 3.0F);
   EXPECT_FLOAT_EQ(values[1], 2.0F);
-  EXPECT_FLOAT_EQ(values[2], 3.0F);
-  EXPECT_FLOAT_EQ(values[3], 4.0F);
+  EXPECT_FLOAT_EQ(values[2], 1.0F);
+  EXPECT_FLOAT_EQ(values[3], 6.0F);
   EXPECT_FLOAT_EQ(values[4], 5.0F);
+  EXPECT_FLOAT_EQ(values[5], 4.0F);
+}
+
+TEST(OpenCvCudaImageToTensorTest, ConvertsBgraGpuMatToRgbaTensor) {
+  if (!HasUsableCudaDevice()) {
+    GTEST_SKIP() << "CUDA image-to-tensor is unavailable";
+  }
+  ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+
+  cv::cuda::GpuMat gpu_image;
+  gpu_image.upload(MakeFourChannelTestMat());
+  RawImageBatch images(std::vector<cv::cuda::GpuMat>{gpu_image});
+
+  Tensor tensor = ToTensor(images, Device{DeviceType::kCuda, 0},
+                           MakeInput({1, 1, 2, 4}), TensorLayout::kBhwc);
+
+  ASSERT_EQ(tensor.shape(), std::vector<int64_t>({1, 1, 2, 4}));
+  ASSERT_EQ(tensor.device().type, DeviceType::kCuda);
+  ASSERT_EQ(tensor.data_type(), DataType::kFloat32);
+
+  const std::vector<float> values = CopyFloatTensorToHost(tensor);
+  EXPECT_FLOAT_EQ(values[0], 3.0F);
+  EXPECT_FLOAT_EQ(values[1], 2.0F);
+  EXPECT_FLOAT_EQ(values[2], 1.0F);
+  EXPECT_FLOAT_EQ(values[3], 4.0F);
+  EXPECT_FLOAT_EQ(values[4], 7.0F);
   EXPECT_FLOAT_EQ(values[5], 6.0F);
+  EXPECT_FLOAT_EQ(values[6], 5.0F);
+  EXPECT_FLOAT_EQ(values[7], 8.0F);
 }
 
 }  // namespace

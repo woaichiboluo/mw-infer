@@ -153,6 +153,9 @@ class Tensor {
     return Tensor(std::move(desc), data_, view_bytes, capacity_bytes_);
   }
 
+  Tensor CopyTo(Device target_device) const;
+  Tensor GatherRows(const Tensor& indices) const;
+
  private:
   Tensor(TensorDesc desc, std::shared_ptr<void> data, std::size_t bytes)
       : Tensor(std::move(desc), std::move(data), bytes, bytes) {}

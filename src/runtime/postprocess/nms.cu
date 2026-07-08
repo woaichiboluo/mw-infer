@@ -9,11 +9,12 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
-#include "mw/infer/runtime/postprocess/nms.h"
+#include "nms_internal.h"
 
-namespace mw::infer {
+namespace mw::infer::postprocess_internal {
 namespace {
 
 constexpr int kThreadsPerBlock = 64;
@@ -131,8 +132,8 @@ __global__ void NmsMaskKernel(int count, float iou_threshold, float offset,
 
 }  // namespace
 
-Tensor RunCudaNms(const Tensor& boxes, const Tensor& scores,
-                  NmsOptions options) {
+Tensor RunNmsOnDevice(const Tensor& boxes, const Tensor& scores,
+                      NmsParameters parameters) {
   const int count = CheckedBoxCount(boxes);
   if (count == 0) {
     throw std::invalid_argument("NMS boxes tensor count must be positive");
@@ -160,7 +161,7 @@ Tensor RunCudaNms(const Tensor& boxes, const Tensor& scores,
       static_cast<std::size_t>(count) * column_blocks, 0);
   dim3 mask_blocks(column_blocks, column_blocks);
   NmsMaskKernel<<<mask_blocks, kThreadsPerBlock>>>(
-      count, options.iou_threshold, options.coordinate_offset,
+      count, parameters.iou_threshold, parameters.coordinate_offset,
       thrust::raw_pointer_cast(sorted_boxes.data()),
       thrust::raw_pointer_cast(mask.data()), column_blocks);
   CheckCuda(cudaGetLastError(), "NmsMaskKernel");
@@ -181,8 +182,8 @@ Tensor RunCudaNms(const Tensor& boxes, const Tensor& scores,
     }
 
     keep.push_back(host_order[sorted_index]);
-    if (options.max_output_boxes > 0 &&
-        keep.size() == static_cast<std::size_t>(options.max_output_boxes)) {
+    if (parameters.max_output_boxes > 0 &&
+        keep.size() == static_cast<std::size_t>(parameters.max_output_boxes)) {
       break;
     }
     const auto* current_mask =
@@ -205,4 +206,4 @@ Tensor RunCudaNms(const Tensor& boxes, const Tensor& scores,
   return output;
 }
 
-}  // namespace mw::infer
+}  // namespace mw::infer::postprocess_internal

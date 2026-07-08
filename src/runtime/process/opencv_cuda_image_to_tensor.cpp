@@ -83,6 +83,33 @@ int TensorImageType(const Tensor& output, int channels) {
   return CV_MAKETYPE(ToOpenCvDepth(output.data_type()), channels);
 }
 
+int RgbSourceChannel(PixelFormat pixel_format, int channel) {
+  switch (pixel_format) {
+    case PixelFormat::kBgr:
+    case PixelFormat::kBgra:
+      if (channel == 0) {
+        return 2;
+      }
+      if (channel == 2) {
+        return 0;
+      }
+      return channel;
+    case PixelFormat::kUnknown:
+    case PixelFormat::kRgb:
+    case PixelFormat::kRgba:
+    case PixelFormat::kGray:
+    case PixelFormat::kNv12:
+    case PixelFormat::kNv21:
+      return channel;
+  }
+  return channel;
+}
+
+bool NeedsRgbChannelOrder(PixelFormat pixel_format) {
+  return pixel_format == PixelFormat::kBgr ||
+         pixel_format == PixelFormat::kBgra;
+}
+
 cv::cuda::GpuMat ToGpuMat(const RawImage& image) {
   if (image.handle_kind() == ImageHandleKind::kOpenCvCudaGpuMat) {
     return GetOpenCvCudaGpuMat(image);
@@ -95,8 +122,8 @@ cv::cuda::GpuMat ToGpuMat(const RawImage& image) {
   throw std::invalid_argument("RawImage does not store an OpenCV image");
 }
 
-void CopyToBhwc(const cv::cuda::GpuMat& image, Tensor* output,
-                std::size_t batch_index) {
+void CopyToBhwc(const cv::cuda::GpuMat& image, PixelFormat pixel_format,
+                Tensor* output, std::size_t batch_index) {
   const std::size_t row_bytes = static_cast<std::size_t>(image.cols) *
                                 image.channels() *
                                 ElementSize(output->data_type());
@@ -105,11 +132,27 @@ void CopyToBhwc(const cv::cuda::GpuMat& image, Tensor* output,
   cv::cuda::GpuMat output_view(
       image.rows, image.cols, TensorImageType(*output, image.channels()),
       TensorBytes(output) + batch_index * image_bytes, row_bytes);
-  image.convertTo(output_view, output_view.type());
+  if (!NeedsRgbChannelOrder(pixel_format)) {
+    image.convertTo(output_view, output_view.type());
+    return;
+  }
+
+  cv::cuda::GpuMat converted;
+  image.convertTo(converted, output_view.type());
+  std::vector<cv::cuda::GpuMat> source_planes;
+  cv::cuda::split(converted, source_planes);
+
+  std::vector<cv::cuda::GpuMat> target_planes;
+  target_planes.reserve(static_cast<std::size_t>(image.channels()));
+  for (int channel = 0; channel < image.channels(); ++channel) {
+    target_planes.push_back(source_planes[static_cast<std::size_t>(
+        RgbSourceChannel(pixel_format, channel))]);
+  }
+  cv::cuda::merge(target_planes, output_view);
 }
 
-void CopyToBchw(const cv::cuda::GpuMat& image, Tensor* output,
-                std::size_t batch_index) {
+void CopyToBchw(const cv::cuda::GpuMat& image, PixelFormat pixel_format,
+                Tensor* output, std::size_t batch_index) {
   const int channels = image.channels();
   const std::size_t plane_elements =
       static_cast<std::size_t>(image.rows) * image.cols;
@@ -132,7 +175,18 @@ void CopyToBchw(const cv::cuda::GpuMat& image, Tensor* output,
 
   cv::cuda::GpuMat converted;
   image.convertTo(converted, TensorImageType(*output, channels));
-  cv::cuda::split(converted, planes);
+  if (!NeedsRgbChannelOrder(pixel_format)) {
+    cv::cuda::split(converted, planes);
+    return;
+  }
+
+  std::vector<cv::cuda::GpuMat> source_planes;
+  cv::cuda::split(converted, source_planes);
+  for (int channel = 0; channel < channels; ++channel) {
+    source_planes[static_cast<std::size_t>(
+                      RgbSourceChannel(pixel_format, channel))]
+        .copyTo(planes[static_cast<std::size_t>(channel)]);
+  }
 }
 
 class OpenCvCudaImageToTensorAdapter final : public ImageToTensorAdapter {
@@ -167,13 +221,14 @@ class OpenCvCudaImageToTensorAdapter final : public ImageToTensorAdapter {
     const std::vector<RawImage>& batch = images.images();
     for (std::size_t batch_index = 0; batch_index < batch.size();
          ++batch_index) {
-      cv::cuda::GpuMat image = ToGpuMat(batch[batch_index]);
+      const RawImage& raw_image = batch[batch_index];
+      cv::cuda::GpuMat image = ToGpuMat(raw_image);
       switch (layout) {
         case TensorLayout::kBchw:
-          CopyToBchw(image, output, batch_index);
+          CopyToBchw(image, raw_image.pixel_format(), output, batch_index);
           break;
         case TensorLayout::kBhwc:
-          CopyToBhwc(image, output, batch_index);
+          CopyToBhwc(image, raw_image.pixel_format(), output, batch_index);
           break;
       }
     }

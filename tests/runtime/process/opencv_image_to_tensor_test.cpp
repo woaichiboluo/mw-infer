@@ -26,7 +26,14 @@ cv::Mat MakeTestMat() {
   return image;
 }
 
-TEST(OpenCvImageToTensorTest, ConvertsHwcMatToBchwTensor) {
+cv::Mat MakeFourChannelTestMat() {
+  cv::Mat image(1, 2, CV_8UC4);
+  image.at<cv::Vec4b>(0, 0) = cv::Vec4b(1, 2, 3, 4);
+  image.at<cv::Vec4b>(0, 1) = cv::Vec4b(5, 6, 7, 8);
+  return image;
+}
+
+TEST(OpenCvImageToTensorTest, ConvertsBgrHwcMatToRgbBchwTensor) {
   RawImageBatch images(std::vector<cv::Mat>{MakeTestMat()});
 
   Tensor tensor =
@@ -36,15 +43,15 @@ TEST(OpenCvImageToTensorTest, ConvertsHwcMatToBchwTensor) {
   ASSERT_EQ(tensor.data_type(), DataType::kFloat32);
 
   const auto* values = static_cast<const float*>(tensor.data());
-  EXPECT_FLOAT_EQ(values[0], 1.0F);
-  EXPECT_FLOAT_EQ(values[1], 4.0F);
+  EXPECT_FLOAT_EQ(values[0], 3.0F);
+  EXPECT_FLOAT_EQ(values[1], 6.0F);
   EXPECT_FLOAT_EQ(values[2], 2.0F);
   EXPECT_FLOAT_EQ(values[3], 5.0F);
-  EXPECT_FLOAT_EQ(values[4], 3.0F);
-  EXPECT_FLOAT_EQ(values[5], 6.0F);
+  EXPECT_FLOAT_EQ(values[4], 1.0F);
+  EXPECT_FLOAT_EQ(values[5], 4.0F);
 }
 
-TEST(OpenCvImageToTensorTest, ConvertsHwcMatToBhwcTensor) {
+TEST(OpenCvImageToTensorTest, ConvertsBgrHwcMatToRgbBhwcTensor) {
   RawImageBatch images(std::vector<cv::Mat>{MakeTestMat()});
 
   Tensor tensor = ToTensor(images, Device{DeviceType::kCpu, 0},
@@ -54,12 +61,32 @@ TEST(OpenCvImageToTensorTest, ConvertsHwcMatToBhwcTensor) {
   ASSERT_EQ(tensor.data_type(), DataType::kFloat32);
 
   const auto* values = static_cast<const float*>(tensor.data());
-  EXPECT_FLOAT_EQ(values[0], 1.0F);
+  EXPECT_FLOAT_EQ(values[0], 3.0F);
   EXPECT_FLOAT_EQ(values[1], 2.0F);
-  EXPECT_FLOAT_EQ(values[2], 3.0F);
-  EXPECT_FLOAT_EQ(values[3], 4.0F);
+  EXPECT_FLOAT_EQ(values[2], 1.0F);
+  EXPECT_FLOAT_EQ(values[3], 6.0F);
   EXPECT_FLOAT_EQ(values[4], 5.0F);
+  EXPECT_FLOAT_EQ(values[5], 4.0F);
+}
+
+TEST(OpenCvImageToTensorTest, ConvertsBgraMatToRgbaTensor) {
+  RawImageBatch images(std::vector<cv::Mat>{MakeFourChannelTestMat()});
+
+  Tensor tensor = ToTensor(images, Device{DeviceType::kCpu, 0},
+                           MakeInput({1, 1, 2, 4}), TensorLayout::kBhwc);
+
+  ASSERT_EQ(tensor.shape(), std::vector<int64_t>({1, 1, 2, 4}));
+  ASSERT_EQ(tensor.data_type(), DataType::kFloat32);
+
+  const auto* values = static_cast<const float*>(tensor.data());
+  EXPECT_FLOAT_EQ(values[0], 3.0F);
+  EXPECT_FLOAT_EQ(values[1], 2.0F);
+  EXPECT_FLOAT_EQ(values[2], 1.0F);
+  EXPECT_FLOAT_EQ(values[3], 4.0F);
+  EXPECT_FLOAT_EQ(values[4], 7.0F);
   EXPECT_FLOAT_EQ(values[5], 6.0F);
+  EXPECT_FLOAT_EQ(values[6], 5.0F);
+  EXPECT_FLOAT_EQ(values[7], 8.0F);
 }
 
 TEST(OpenCvImageToTensorTest, ConvertsToFloat16WhenModelInputRequiresIt) {
@@ -70,8 +97,8 @@ TEST(OpenCvImageToTensorTest, ConvertsToFloat16WhenModelInputRequiresIt) {
 
   ASSERT_EQ(tensor.data_type(), DataType::kFloat16);
   const auto* values = static_cast<const uint16_t*>(tensor.data());
-  EXPECT_EQ(values[0], 0x3C00U);
-  EXPECT_EQ(values[1], 0x4400U);
+  EXPECT_EQ(values[0], 0x4200U);
+  EXPECT_EQ(values[1], 0x4600U);
 }
 
 TEST(OpenCvImageToTensorTest, ReusesBuffer) {
