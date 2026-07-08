@@ -37,10 +37,14 @@ struct Device {
   int id = 0;
 };
 
-struct TensorDesc {
+struct TensorInfo {
   std::string name;
   DataType data_type = DataType::kUnknown;
   std::vector<int64_t> shape;
+};
+
+struct TensorDesc {
+  TensorInfo info;
   Device device;
 };
 
@@ -81,7 +85,7 @@ inline std::size_t ElementCount(const std::vector<int64_t>& shape) {
 }
 
 inline std::size_t TensorBytes(const TensorDesc& desc) {
-  return ElementCount(desc.shape) * DataTypeSize(desc.data_type);
+  return ElementCount(desc.info.shape) * DataTypeSize(desc.info.data_type);
 }
 
 class Tensor {
@@ -121,15 +125,16 @@ class Tensor {
 
   bool empty() const { return !data_; }
   const TensorDesc& desc() const { return desc_; }
-  const std::string& name() const { return desc_.name; }
-  DataType data_type() const { return desc_.data_type; }
-  const std::vector<int64_t>& shape() const { return desc_.shape; }
+  const TensorInfo& info() const { return desc_.info; }
+  const std::string& name() const { return desc_.info.name; }
+  DataType data_type() const { return desc_.info.data_type; }
+  const std::vector<int64_t>& shape() const { return desc_.info.shape; }
   Device device() const { return desc_.device; }
   void* data() { return data_.get(); }
   const void* data() const { return data_.get(); }
   std::size_t bytes() const { return bytes_; }
   std::size_t capacity_bytes() const { return capacity_bytes_; }
-  std::size_t element_count() const { return ElementCount(desc_.shape); }
+  std::size_t element_count() const { return ElementCount(desc_.info.shape); }
 
   Tensor View(TensorDesc desc) const {
     if (empty()) {

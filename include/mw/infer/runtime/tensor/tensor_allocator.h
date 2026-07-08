@@ -2,13 +2,12 @@
 #define MW_INFER_RUNTIME_TENSOR_TENSOR_ALLOCATOR_H_
 
 #include <cstddef>
+#include <memory>
 #include <vector>
 
 #include "mw/infer/runtime/tensor/tensor.h"
 
 namespace mw::infer {
-
-Tensor AllocateHostTensor(TensorDesc desc);
 
 class TensorAllocationAdapter {
  public:
@@ -18,19 +17,19 @@ class TensorAllocationAdapter {
   virtual Tensor Allocate(TensorDesc desc) const = 0;
 };
 
-const TensorAllocationAdapter& GetHostTensorAllocationAdapter();
-
 class TensorAllocator {
  public:
   TensorAllocator();
   explicit TensorAllocator(
-      std::vector<const TensorAllocationAdapter*> adapters);
+      std::vector<std::unique_ptr<TensorAllocationAdapter>> adapters);
 
   bool Supports(Device device) const;
   Tensor Allocate(TensorDesc desc) const;
 
  private:
-  std::vector<const TensorAllocationAdapter*> adapters_;
+  void AddAdapter(std::unique_ptr<TensorAllocationAdapter> adapter);
+
+  std::vector<std::unique_ptr<TensorAllocationAdapter>> adapters_;
 };
 
 class TensorBuffer {

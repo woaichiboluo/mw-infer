@@ -1,4 +1,4 @@
-#include "mw/infer/runtime/model.h"
+#include "mw/infer/runtime/backend/model.h"
 
 #include <cctype>
 #include <stdexcept>

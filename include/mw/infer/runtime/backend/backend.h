@@ -3,22 +3,13 @@
 
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "mw/infer/runtime/backend/model.h"
 #include "mw/infer/runtime/tensor/tensor.h"
 
 namespace mw::infer {
-
-struct TensorInfo {
-  std::string name;
-  DataType data_type = DataType::kUnknown;
-  std::vector<int64_t> shape;
-};
-
-struct ModelInfo {
-  std::vector<TensorInfo> inputs;
-  std::vector<TensorInfo> outputs;
-};
 
 inline bool HasDynamicShape(const TensorInfo& info) {
   for (int64_t dim : info.shape) {
@@ -33,11 +24,62 @@ class IBackend {
  public:
   virtual ~IBackend() = default;
 
-  virtual const ModelInfo& model_info() const = 0;
+  IBackend(const IBackend&) = delete;
+  IBackend& operator=(const IBackend&) = delete;
+  IBackend(IBackend&&) noexcept = default;
+  IBackend& operator=(IBackend&&) noexcept = default;
+
+  const Model& model() const { return model_; }
+  const ModelInfo& model_info() const { return model_.info; }
+  Device execution_device() const { return execution_device_; }
+  std::vector<Tensor> Infer(const Tensor& input) {
+    return Infer(std::vector<Tensor>{input});
+  }
   virtual std::vector<Tensor> Infer(const std::vector<Tensor>& inputs) = 0;
+
+ protected:
+  IBackend(Model model, Device execution_device)
+      : model_(std::move(model)), execution_device_(execution_device) {}
+
+  Model& mutable_model() { return model_; }
+
+ private:
+  Model model_;
+  Device execution_device_;
 };
 
 using BackendPtr = std::unique_ptr<IBackend>;
+
+class BackendAdapter {
+ public:
+  virtual ~BackendAdapter() = default;
+
+  virtual bool Supports(const Model& model, Device execution_device) const = 0;
+  virtual BackendPtr Create(Model model, Device execution_device,
+                            std::vector<std::string> output_names) const = 0;
+};
+
+class BackendFactory {
+ public:
+  BackendFactory();
+  explicit BackendFactory(
+      std::vector<std::unique_ptr<BackendAdapter>> adapters);
+
+  bool Supports(const Model& model,
+                Device execution_device = Device{DeviceType::kCpu, 0}) const;
+  BackendPtr Create(Model model,
+                    Device execution_device = Device{DeviceType::kCpu, 0},
+                    std::vector<std::string> output_names = {}) const;
+
+ private:
+  void AddAdapter(std::unique_ptr<BackendAdapter> adapter);
+
+  std::vector<std::unique_ptr<BackendAdapter>> adapters_;
+};
+
+BackendPtr CreateBackend(Model model,
+                         Device execution_device = Device{DeviceType::kCpu, 0},
+                         std::vector<std::string> output_names = {});
 
 }  // namespace mw::infer
 

@@ -138,13 +138,12 @@ class GeometryAdapter {
 
 class GeometryTransformer {
  public:
-  GeometryTransformer() = default;
+  GeometryTransformer();
   GeometryTransformer(const GeometryTransformer&) = delete;
   GeometryTransformer& operator=(const GeometryTransformer&) = delete;
   GeometryTransformer(GeometryTransformer&&) noexcept = default;
   GeometryTransformer& operator=(GeometryTransformer&&) noexcept = default;
 
-  void AddAdapter(std::unique_ptr<GeometryAdapter> adapter);
   bool Supports(const RawImage& image) const;
 
   GeometryResult Resize(
@@ -169,30 +168,11 @@ class GeometryTransformer {
                            FillValue value = {}) const;
 
  private:
+  void AddAdapter(std::unique_ptr<GeometryAdapter> adapter);
   const GeometryAdapter& SelectAdapter(const RawImage& image) const;
 
   std::vector<std::unique_ptr<GeometryAdapter>> adapters_;
 };
-
-const GeometryTransformer& DefaultGeometryTransformer();
-
-GeometryResult Resize(GeometryResult result, ImageSize size,
-                      Interpolation interpolation = Interpolation::kLinear);
-GeometryResult Resize(RawImageBatch images, ImageSize size,
-                      Interpolation interpolation = Interpolation::kLinear);
-GeometryResult Pad(GeometryResult result, Padding padding,
-                   FillValue value = {});
-GeometryResult Pad(RawImageBatch images, Padding padding, FillValue value = {});
-GeometryResult Crop(GeometryResult result, Rect rect);
-GeometryResult Crop(RawImageBatch images, Rect rect);
-GeometryResult CenterCrop(GeometryResult result, ImageSize size);
-GeometryResult CenterCrop(RawImageBatch images, ImageSize size);
-GeometryResult LetterBox(GeometryResult result, ImageSize size,
-                         Interpolation interpolation = Interpolation::kLinear,
-                         FillValue value = {});
-GeometryResult LetterBox(RawImageBatch images, ImageSize size,
-                         Interpolation interpolation = Interpolation::kLinear,
-                         FillValue value = {});
 
 }  // namespace mw::infer
 

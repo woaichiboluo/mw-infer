@@ -303,6 +303,15 @@ const GeometryTrace& GeometryResult::trace(std::size_t index) const {
   return traces_.at(index);
 }
 
+GeometryTransformer::GeometryTransformer() {
+#if defined(MW_INFER_HAS_OPENCV_GEOMETRY_ADAPTER)
+  AddAdapter(CreateOpenCvMatGeometryAdapter());
+#endif
+#if defined(MW_INFER_HAS_OPENCV_CUDA_ADAPTER)
+  AddAdapter(CreateOpenCvCudaGeometryAdapter());
+#endif
+}
+
 void GeometryTransformer::AddAdapter(std::unique_ptr<GeometryAdapter> adapter) {
   if (!adapter) {
     throw std::invalid_argument("Geometry adapter is null");
@@ -342,7 +351,7 @@ GeometryResult GeometryTransformer::Resize(GeometryResult result,
 
 GeometryResult GeometryTransformer::Resize(RawImageBatch images, ImageSize size,
                                            Interpolation interpolation) const {
-  return Resize(GeometryResult(std::move(images)), size, interpolation);
+  return this->Resize(GeometryResult(std::move(images)), size, interpolation);
 }
 
 GeometryResult GeometryTransformer::Pad(GeometryResult result, Padding padding,
@@ -367,7 +376,8 @@ GeometryResult GeometryTransformer::Pad(GeometryResult result, Padding padding,
 
 GeometryResult GeometryTransformer::Pad(RawImageBatch images, Padding padding,
                                         FillValue value) const {
-  return Pad(GeometryResult(std::move(images)), padding, std::move(value));
+  return this->Pad(GeometryResult(std::move(images)), padding,
+                   std::move(value));
 }
 
 GeometryResult GeometryTransformer::Crop(GeometryResult result,
@@ -392,7 +402,7 @@ GeometryResult GeometryTransformer::Crop(GeometryResult result,
 
 GeometryResult GeometryTransformer::Crop(RawImageBatch images,
                                          Rect rect) const {
-  return Crop(GeometryResult(std::move(images)), rect);
+  return this->Crop(GeometryResult(std::move(images)), rect);
 }
 
 GeometryResult GeometryTransformer::CenterCrop(GeometryResult result,
@@ -418,7 +428,7 @@ GeometryResult GeometryTransformer::CenterCrop(GeometryResult result,
 
 GeometryResult GeometryTransformer::CenterCrop(RawImageBatch images,
                                                ImageSize size) const {
-  return CenterCrop(GeometryResult(std::move(images)), size);
+  return this->CenterCrop(GeometryResult(std::move(images)), size);
 }
 
 GeometryResult GeometryTransformer::LetterBox(GeometryResult result,
@@ -452,8 +462,8 @@ GeometryResult GeometryTransformer::LetterBox(RawImageBatch images,
                                               ImageSize size,
                                               Interpolation interpolation,
                                               FillValue value) const {
-  return LetterBox(GeometryResult(std::move(images)), size, interpolation,
-                   std::move(value));
+  return this->LetterBox(GeometryResult(std::move(images)), size, interpolation,
+                         std::move(value));
 }
 
 const GeometryAdapter& GeometryTransformer::SelectAdapter(
@@ -464,70 +474,6 @@ const GeometryAdapter& GeometryTransformer::SelectAdapter(
     }
   }
   throw std::invalid_argument("No geometry adapter supports this RawImage");
-}
-
-const GeometryTransformer& DefaultGeometryTransformer() {
-  static const GeometryTransformer transformer = [] {
-    GeometryTransformer transformer;
-#if defined(MW_INFER_HAS_OPENCV_GEOMETRY_ADAPTER)
-    transformer.AddAdapter(CreateOpenCvMatGeometryAdapter());
-#endif
-#if defined(MW_INFER_HAS_OPENCV_CUDA_ADAPTER)
-    transformer.AddAdapter(CreateOpenCvCudaGeometryAdapter());
-#endif
-    return transformer;
-  }();
-  return transformer;
-}
-
-GeometryResult Resize(GeometryResult result, ImageSize size,
-                      Interpolation interpolation) {
-  return DefaultGeometryTransformer().Resize(std::move(result), size,
-                                             interpolation);
-}
-
-GeometryResult Resize(RawImageBatch images, ImageSize size,
-                      Interpolation interpolation) {
-  return DefaultGeometryTransformer().Resize(std::move(images), size,
-                                             interpolation);
-}
-
-GeometryResult Pad(GeometryResult result, Padding padding, FillValue value) {
-  return DefaultGeometryTransformer().Pad(std::move(result), padding,
-                                          std::move(value));
-}
-
-GeometryResult Pad(RawImageBatch images, Padding padding, FillValue value) {
-  return DefaultGeometryTransformer().Pad(std::move(images), padding,
-                                          std::move(value));
-}
-
-GeometryResult Crop(GeometryResult result, Rect rect) {
-  return DefaultGeometryTransformer().Crop(std::move(result), rect);
-}
-
-GeometryResult Crop(RawImageBatch images, Rect rect) {
-  return DefaultGeometryTransformer().Crop(std::move(images), rect);
-}
-
-GeometryResult CenterCrop(GeometryResult result, ImageSize size) {
-  return DefaultGeometryTransformer().CenterCrop(std::move(result), size);
-}
-
-GeometryResult CenterCrop(RawImageBatch images, ImageSize size) {
-  return DefaultGeometryTransformer().CenterCrop(std::move(images), size);
-}
-
-GeometryResult LetterBox(GeometryResult result, ImageSize size,
-                         Interpolation interpolation, FillValue value) {
-  return DefaultGeometryTransformer().LetterBox(
-      std::move(result), size, interpolation, std::move(value));
-}
-
-GeometryResult LetterBox(RawImageBatch images, ImageSize size,
-                         Interpolation interpolation, FillValue value) {
-  return DefaultGeometryTransformer().LetterBox(
-      std::move(images), size, interpolation, std::move(value));
 }
 
 }  // namespace mw::infer

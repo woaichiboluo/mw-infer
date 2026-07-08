@@ -1,64 +1,47 @@
 #include "mw/infer/runtime/tensor/tensor_allocator.h"
 
-#include <new>
+#include <memory>
 #include <stdexcept>
 #include <utility>
 
 namespace mw::infer {
-namespace {
 
-class HostTensorAllocationAdapter final : public TensorAllocationAdapter {
- public:
-  bool Supports(Device device) const override {
-    return device.type == DeviceType::kCpu;
-  }
+std::unique_ptr<TensorAllocationAdapter> CreateHostTensorAllocationAdapter();
 
-  Tensor Allocate(TensorDesc desc) const override {
-    return AllocateHostTensor(std::move(desc));
-  }
-};
+#if defined(MW_INFER_HAS_CUDA_TENSOR_ADAPTER)
+std::unique_ptr<TensorAllocationAdapter> CreateCudaTensorAllocationAdapter();
+#endif
 
-}  // namespace
-
-Tensor AllocateHostTensor(TensorDesc desc) {
-  if (desc.device.type != DeviceType::kCpu) {
-    throw std::invalid_argument("Host tensor allocation requires a CPU device");
-  }
-
-  const std::size_t bytes = TensorBytes(desc);
-  void* data = ::operator new(bytes);
-  try {
-    return Tensor::FromBuffer(std::move(desc), data, bytes,
-                              [](void* ptr) { ::operator delete(ptr); });
-  } catch (...) {
-    ::operator delete(data);
-    throw;
-  }
+TensorAllocator::TensorAllocator() {
+  AddAdapter(CreateHostTensorAllocationAdapter());
+#if defined(MW_INFER_HAS_CUDA_TENSOR_ADAPTER)
+  AddAdapter(CreateCudaTensorAllocationAdapter());
+#endif
 }
-
-const TensorAllocationAdapter& GetHostTensorAllocationAdapter() {
-  static const HostTensorAllocationAdapter adapter;
-  return adapter;
-}
-
-TensorAllocator::TensorAllocator()
-    : TensorAllocator({&GetHostTensorAllocationAdapter()}) {}
 
 TensorAllocator::TensorAllocator(
-    std::vector<const TensorAllocationAdapter*> adapters)
+    std::vector<std::unique_ptr<TensorAllocationAdapter>> adapters)
     : adapters_(std::move(adapters)) {
   if (adapters_.empty()) {
     throw std::invalid_argument("Tensor allocator has no adapters");
   }
-  for (const TensorAllocationAdapter* adapter : adapters_) {
-    if (adapter == nullptr) {
+  for (const auto& adapter : adapters_) {
+    if (!adapter) {
       throw std::invalid_argument("Tensor allocator adapter is null");
     }
   }
 }
 
+void TensorAllocator::AddAdapter(
+    std::unique_ptr<TensorAllocationAdapter> adapter) {
+  if (!adapter) {
+    throw std::invalid_argument("Tensor allocator adapter is null");
+  }
+  adapters_.push_back(std::move(adapter));
+}
+
 bool TensorAllocator::Supports(Device device) const {
-  for (const TensorAllocationAdapter* adapter : adapters_) {
+  for (const auto& adapter : adapters_) {
     if (adapter->Supports(device)) {
       return true;
     }
@@ -67,7 +50,7 @@ bool TensorAllocator::Supports(Device device) const {
 }
 
 Tensor TensorAllocator::Allocate(TensorDesc desc) const {
-  for (const TensorAllocationAdapter* adapter : adapters_) {
+  for (const auto& adapter : adapters_) {
     if (adapter->Supports(desc.device)) {
       return adapter->Allocate(std::move(desc));
     }
