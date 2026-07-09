@@ -12,7 +12,7 @@ namespace mw::infer {
 namespace process_internal {
 Tensor RunNormalizeOnDevice(const Tensor& input, const std::vector<float>& mean,
                             const std::vector<float>& stddev, float scale,
-                            TensorLayout layout);
+                            TensorLayout layout, TensorAllocator& allocator);
 }  // namespace process_internal
 #endif
 
@@ -88,8 +88,9 @@ TensorDesc MakeOutputDesc(const Tensor& input) {
 
 Tensor RunNormalizeOnHost(const Tensor& input, const std::vector<float>& mean,
                           const std::vector<float>& stddev, float scale,
-                          ImageTensorShape shape, TensorLayout layout) {
-  Tensor output = Tensor::Allocate(MakeOutputDesc(input));
+                          ImageTensorShape shape, TensorLayout layout,
+                          TensorAllocator& allocator) {
+  Tensor output = Tensor::Allocate(MakeOutputDesc(input), allocator);
   const auto* input_data = static_cast<const float*>(input.data());
   auto* output_data = static_cast<float*>(output.data());
 
@@ -122,16 +123,17 @@ Tensor RunNormalizeOnHost(const Tensor& input, const std::vector<float>& mean,
 
 Tensor Normalize(const Tensor& input, const std::vector<float>& mean,
                  const std::vector<float>& stddev, float scale,
-                 TensorLayout layout) {
+                 TensorLayout layout, TensorAllocator& allocator) {
   const ImageTensorShape shape = ValidateImageTensor(input, layout);
   ValidateParameters(mean, stddev, scale, shape.channels);
   if (input.device().type == DeviceType::kCpu) {
-    return RunNormalizeOnHost(input, mean, stddev, scale, shape, layout);
+    return RunNormalizeOnHost(input, mean, stddev, scale, shape, layout,
+                              allocator);
   }
   if (input.device().type == DeviceType::kCuda) {
 #if defined(MW_INFER_HAS_CUDA_PREPROCESS)
     return process_internal::RunNormalizeOnDevice(input, mean, stddev, scale,
-                                                  layout);
+                                                  layout, allocator);
 #else
     throw std::runtime_error("CUDA preprocess is unavailable in this build");
 #endif

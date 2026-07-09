@@ -41,10 +41,8 @@ class ImageToTensorConverter {
                 TensorLayout layout = TensorLayout::kBchw) const;
   Tensor Convert(const RawImageBatch& images, Device target_device,
                  const TensorInfo& input,
-                 TensorLayout layout = TensorLayout::kBchw) const;
-  Tensor Convert(const RawImageBatch& images, Device target_device,
-                 const TensorInfo& input, TensorBuffer& buffer,
-                 TensorLayout layout = TensorLayout::kBchw) const;
+                 TensorLayout layout = TensorLayout::kBchw,
+                 TensorAllocator& allocator = TensorAllocator::Default()) const;
 
  private:
   void AddAdapter(std::unique_ptr<ImageToTensorAdapter> adapter);
@@ -58,10 +56,8 @@ class ImageToTensorConverter {
 
 Tensor ToTensor(const RawImageBatch& images, Device target_device,
                 const TensorInfo& input,
-                TensorLayout layout = TensorLayout::kBchw);
-Tensor ToTensor(const RawImageBatch& images, Device target_device,
-                const TensorInfo& input, TensorBuffer& buffer,
-                TensorLayout layout = TensorLayout::kBchw);
+                TensorLayout layout = TensorLayout::kBchw,
+                TensorAllocator& allocator = TensorAllocator::Default());
 
 }  // namespace mw::infer
 

@@ -4,6 +4,7 @@
 #include <cstdint>
 
 #include "mw/infer/runtime/tensor/tensor.h"
+#include "mw/infer/runtime/tensor/tensor_allocator.h"
 
 namespace mw::infer {
 
@@ -12,7 +13,8 @@ struct TopKResult {
   Tensor indices;
 };
 
-TopKResult TopK(const Tensor& scores, int64_t k);
+TopKResult TopK(const Tensor& scores, int64_t k,
+                TensorAllocator& allocator = TensorAllocator::Default());
 
 }  // namespace mw::infer
 

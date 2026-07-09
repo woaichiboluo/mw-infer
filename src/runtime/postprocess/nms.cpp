@@ -98,26 +98,25 @@ std::vector<int64_t> MakeScoreOrder(const float* scores, std::size_t count) {
   return order;
 }
 
-Tensor MakeIndexTensor(std::vector<int64_t> indices, Device device) {
-  if (indices.empty()) {
-    throw std::invalid_argument("NMS index tensor cannot be empty");
-  }
-
+Tensor MakeIndexTensor(std::vector<int64_t> indices, Device device,
+                       TensorAllocator& allocator) {
   TensorDesc desc;
   desc.info.name = "nms_indices";
   desc.info.data_type = DataType::kInt64;
   desc.info.shape = {static_cast<int64_t>(indices.size())};
   desc.device = device;
-  Tensor output = Tensor::Allocate(std::move(desc));
-  std::memcpy(output.data(), indices.data(), output.bytes());
+  Tensor output = Tensor::Allocate(std::move(desc), allocator);
+  if (output.bytes() > 0) {
+    std::memcpy(output.data(), indices.data(), output.bytes());
+  }
   return output;
 }
 
 Tensor RunNmsOnHost(const Tensor& boxes, const Tensor& scores,
-                    NmsParameters parameters) {
+                    NmsParameters parameters, TensorAllocator& allocator) {
   const std::size_t count = BoxCount(boxes);
   if (count == 0) {
-    throw std::invalid_argument("NMS boxes tensor count must be positive");
+    return MakeIndexTensor({}, boxes.device(), allocator);
   }
 
   const auto* boxes_data = static_cast<const float*>(boxes.data());
@@ -158,13 +157,14 @@ Tensor RunNmsOnHost(const Tensor& boxes, const Tensor& scores,
       }
     }
   }
-  return MakeIndexTensor(std::move(keep), boxes.device());
+  return MakeIndexTensor(std::move(keep), boxes.device(), allocator);
 }
 
 }  // namespace
 
 Tensor Nms(const Tensor& boxes, const Tensor& scores, float iou_threshold,
-           float coordinate_offset, int64_t max_output_boxes) {
+           float coordinate_offset, int64_t max_output_boxes,
+           TensorAllocator& allocator) {
   NmsParameters parameters;
   parameters.iou_threshold = iou_threshold;
   parameters.coordinate_offset = coordinate_offset;
@@ -173,11 +173,12 @@ Tensor Nms(const Tensor& boxes, const Tensor& scores, float iou_threshold,
   ValidateInputs(boxes, scores);
 
   if (boxes.device().type == DeviceType::kCpu) {
-    return RunNmsOnHost(boxes, scores, parameters);
+    return RunNmsOnHost(boxes, scores, parameters, allocator);
   }
   if (boxes.device().type == DeviceType::kCuda) {
 #if defined(MW_INFER_HAS_CUDA_POSTPROCESS)
-    return postprocess_internal::RunNmsOnDevice(boxes, scores, parameters);
+    return postprocess_internal::RunNmsOnDevice(boxes, scores, parameters,
+                                                allocator);
 #else
     throw std::runtime_error("CUDA NMS is unavailable in this build");
 #endif

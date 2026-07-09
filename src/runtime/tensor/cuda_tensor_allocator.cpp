@@ -34,6 +34,10 @@ Tensor AllocateCudaTensor(TensorDesc desc) {
   CheckCuda(cudaSetDevice(device_id), "cudaSetDevice");
 
   const std::size_t bytes = TensorBytes(desc);
+  if (bytes == 0) {
+    return Tensor::FromBuffer(std::move(desc), nullptr, 0, [](void*) {});
+  }
+
   void* data = nullptr;
   CheckCuda(cudaMalloc(&data, bytes), "cudaMalloc");
 
@@ -58,7 +62,7 @@ class CudaTensorAllocationAdapter final : public TensorAllocationAdapter {
     return device.type == DeviceType::kCuda;
   }
 
-  Tensor Allocate(TensorDesc desc) const override {
+  Tensor Allocate(TensorDesc desc) override {
     return AllocateCudaTensor(std::move(desc));
   }
 };

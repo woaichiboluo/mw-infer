@@ -133,10 +133,15 @@ __global__ void NmsMaskKernel(int count, float iou_threshold, float offset,
 }  // namespace
 
 Tensor RunNmsOnDevice(const Tensor& boxes, const Tensor& scores,
-                      NmsParameters parameters) {
+                      NmsParameters parameters, TensorAllocator& allocator) {
   const int count = CheckedBoxCount(boxes);
   if (count == 0) {
-    throw std::invalid_argument("NMS boxes tensor count must be positive");
+    TensorDesc desc;
+    desc.info.name = "nms_indices";
+    desc.info.data_type = DataType::kInt64;
+    desc.info.shape = {0};
+    desc.device = boxes.device();
+    return Tensor::Allocate(std::move(desc), allocator);
   }
 
   CheckCuda(cudaSetDevice(boxes.device().id), "cudaSetDevice");
@@ -199,10 +204,12 @@ Tensor RunNmsOnDevice(const Tensor& boxes, const Tensor& scores,
   desc.info.data_type = DataType::kInt64;
   desc.info.shape = {static_cast<int64_t>(keep.size())};
   desc.device = boxes.device();
-  Tensor output = Tensor::Allocate(std::move(desc));
-  CheckCuda(cudaMemcpy(output.data(), keep.data(), output.bytes(),
-                       cudaMemcpyHostToDevice),
-            "cudaMemcpy");
+  Tensor output = Tensor::Allocate(std::move(desc), allocator);
+  if (output.bytes() > 0) {
+    CheckCuda(cudaMemcpy(output.data(), keep.data(), output.bytes(),
+                         cudaMemcpyHostToDevice),
+              "cudaMemcpy");
+  }
   return output;
 }
 

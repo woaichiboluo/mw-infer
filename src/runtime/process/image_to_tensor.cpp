@@ -185,7 +185,8 @@ bool ImageToTensorConverter::Supports(const RawImageBatch& images,
 Tensor ImageToTensorConverter::Convert(const RawImageBatch& images,
                                        Device target_device,
                                        const TensorInfo& input,
-                                       TensorLayout layout) const {
+                                       TensorLayout layout,
+                                       TensorAllocator& allocator) const {
   ValidateRawImages(images);
   ValidateTargetDevice(target_device);
   ValidateLayout(layout);
@@ -193,26 +194,8 @@ Tensor ImageToTensorConverter::Convert(const RawImageBatch& images,
 
   const ImageToTensorAdapter& adapter =
       SelectAdapter(images, target_device, input, layout);
-  Tensor output =
-      Tensor::Allocate(MakeTensorDesc(images, target_device, input, layout));
-  adapter.Convert(images, &output, layout);
-  return output;
-}
-
-Tensor ImageToTensorConverter::Convert(const RawImageBatch& images,
-                                       Device target_device,
-                                       const TensorInfo& input,
-                                       TensorBuffer& buffer,
-                                       TensorLayout layout) const {
-  ValidateRawImages(images);
-  ValidateTargetDevice(target_device);
-  ValidateLayout(layout);
-  ValidateInputInfo(input);
-
-  const ImageToTensorAdapter& adapter =
-      SelectAdapter(images, target_device, input, layout);
-  Tensor output =
-      buffer.Ensure(MakeTensorDesc(images, target_device, input, layout));
+  Tensor output = Tensor::Allocate(
+      MakeTensorDesc(images, target_device, input, layout), allocator);
   adapter.Convert(images, &output, layout);
   return output;
 }
@@ -230,15 +213,10 @@ const ImageToTensorAdapter& ImageToTensorConverter::SelectAdapter(
 }
 
 Tensor ToTensor(const RawImageBatch& images, Device target_device,
-                const TensorInfo& input, TensorLayout layout) {
-  return ImageToTensorConverter().Convert(images, target_device, input, layout);
-}
-
-Tensor ToTensor(const RawImageBatch& images, Device target_device,
-                const TensorInfo& input, TensorBuffer& buffer,
-                TensorLayout layout) {
-  return ImageToTensorConverter().Convert(images, target_device, input, buffer,
-                                          layout);
+                const TensorInfo& input, TensorLayout layout,
+                TensorAllocator& allocator) {
+  return ImageToTensorConverter().Convert(images, target_device, input, layout,
+                                          allocator);
 }
 
 }  // namespace mw::infer

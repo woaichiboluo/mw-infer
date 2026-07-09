@@ -10,7 +10,8 @@
 namespace mw::infer {
 
 Tensor ReorderChannels(const Tensor& input, const std::vector<int64_t>& order,
-                       TensorLayout layout = TensorLayout::kBchw);
+                       TensorLayout layout = TensorLayout::kBchw,
+                       TensorAllocator& allocator = TensorAllocator::Default());
 
 }  // namespace mw::infer
 

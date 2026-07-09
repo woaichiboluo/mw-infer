@@ -47,6 +47,8 @@ struct FillValue {
   std::vector<double> channels;
 };
 
+ImageSize ResizeShortSideSize(ImageSize input_size, int short_side);
+
 enum class GeometryStepKind {
   kResize,
   kPad,
@@ -118,6 +120,8 @@ class GeometryResult {
   const RawImageBatch& images() const;
   const std::vector<GeometryTrace>& traces() const;
   const GeometryTrace& trace(std::size_t index) const;
+  ImageSize original_size(std::size_t index) const;
+  ImageSize transformed_size(std::size_t index) const;
 
  private:
   RawImageBatch images_;
@@ -151,6 +155,12 @@ class GeometryTransformer {
       Interpolation interpolation = Interpolation::kLinear) const;
   GeometryResult Resize(
       RawImageBatch images, ImageSize size,
+      Interpolation interpolation = Interpolation::kLinear) const;
+  GeometryResult ResizeShortSide(
+      GeometryResult result, int short_side,
+      Interpolation interpolation = Interpolation::kLinear) const;
+  GeometryResult ResizeShortSide(
+      RawImageBatch images, int short_side,
       Interpolation interpolation = Interpolation::kLinear) const;
   GeometryResult Pad(GeometryResult result, Padding padding,
                      FillValue value = {}) const;

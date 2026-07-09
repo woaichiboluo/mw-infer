@@ -70,6 +70,20 @@ TEST(CudaTensorAllocatorTest, AllocatesCudaTensor) {
   EXPECT_EQ(cudaMemset(tensor.data(), 0, tensor.bytes()), cudaSuccess);
 }
 
+TEST(CudaTensorAllocatorTest, AllocatesZeroSizedCudaTensor) {
+  if (!HasUsableCudaDevice()) {
+    GTEST_SKIP() << "CUDA tensor allocation is unavailable";
+  }
+
+  Tensor tensor = Tensor::Allocate(MakeCudaDescWithShape({0, 3}));
+
+  EXPECT_FALSE(tensor.empty());
+  EXPECT_EQ(tensor.device().type, DeviceType::kCuda);
+  EXPECT_EQ(tensor.element_count(), 0U);
+  EXPECT_EQ(tensor.bytes(), 0U);
+  EXPECT_EQ(tensor.capacity_bytes(), 0U);
+}
+
 TEST(CudaTensorAllocatorTest, TensorInterfaceSelectsCudaAdapterByDevice) {
   if (!HasUsableCudaDevice()) {
     GTEST_SKIP() << "CUDA tensor allocation is unavailable";
@@ -124,89 +138,102 @@ TEST(CudaTensorAllocatorTest, CopiesCudaTensorToCudaDevice) {
             std::vector<float>({1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F}));
 }
 
-TEST(CudaTensorAllocatorTest, TensorBufferReusesAndGrowsLikeVectorReserve) {
+TEST(CudaTensorAllocatorTest, CopiesCudaTensorToHostVector) {
+  if (!HasUsableCudaDevice()) {
+    GTEST_SKIP() << "CUDA tensor copy is unavailable";
+  }
+
+  Tensor host = MakeHostTensor({2, 3}, {1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F});
+  Tensor device = host.CopyTo(Device{DeviceType::kCuda, 0});
+
+  EXPECT_EQ(device.CopyToHostVector<float>(),
+            std::vector<float>({1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F}));
+  EXPECT_THROW(static_cast<void>(device.CopyToHostVector<int64_t>()),
+               std::invalid_argument);
+}
+
+TEST(CudaTensorAllocatorTest, ReadsCudaElementAtMultiDimensionalIndex) {
+  if (!HasUsableCudaDevice()) {
+    GTEST_SKIP() << "CUDA tensor copy is unavailable";
+  }
+
+  Tensor host = MakeHostTensor({2, 3}, {1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F});
+  Tensor device = host.CopyTo(Device{DeviceType::kCuda, 0});
+
+  EXPECT_FLOAT_EQ(device.At<float>({0, 0}), 1.0F);
+  EXPECT_FLOAT_EQ(device.At<float>({1, 2}), 6.0F);
+  EXPECT_THROW(static_cast<void>(device.At<float>({2, 0})),
+               std::invalid_argument);
+  EXPECT_THROW(static_cast<void>(device.At<int64_t>({0, 0})),
+               std::invalid_argument);
+}
+
+TEST(CudaTensorAllocatorTest, PooledTensorAllocatorReusesReleasedCudaBlocks) {
   if (!HasUsableCudaDevice()) {
     GTEST_SKIP() << "CUDA tensor allocation is unavailable";
   }
 
-  TensorBuffer buffer;
+  PooledTensorAllocator allocator;
 
-  Tensor first = buffer.Ensure(MakeCudaDescWithShape({4, 3, 2, 2}));
-  void* first_data = first.data();
-  EXPECT_EQ(first.bytes(), 192U);
-  EXPECT_EQ(first.capacity_bytes(), 192U);
-  EXPECT_EQ(buffer.capacity_bytes(), 192U);
+  void* first_data = nullptr;
+  {
+    Tensor first =
+        Tensor::Allocate(MakeCudaDescWithShape({4, 3, 2, 2}), allocator);
+    first_data = first.data();
+    EXPECT_EQ(first.bytes(), 192U);
+    EXPECT_EQ(first.capacity_bytes(), 192U);
+  }
 
-  Tensor smaller = buffer.Ensure(MakeCudaDescWithShape({2, 3, 2, 2}));
+  Tensor smaller =
+      Tensor::Allocate(MakeCudaDescWithShape({2, 3, 2, 2}), allocator);
   EXPECT_EQ(smaller.data(), first_data);
   EXPECT_EQ(smaller.bytes(), 96U);
   EXPECT_EQ(smaller.capacity_bytes(), 192U);
-  EXPECT_EQ(buffer.capacity_bytes(), 192U);
+  EXPECT_EQ(cudaMemset(smaller.data(), 0, smaller.bytes()), cudaSuccess);
 
-  Tensor larger = buffer.Ensure(MakeCudaDescWithShape({8, 3, 2, 2}));
+  Tensor active =
+      Tensor::Allocate(MakeCudaDescWithShape({2, 3, 2, 2}), allocator);
+  EXPECT_NE(active.data(), smaller.data());
+}
+
+TEST(CudaTensorAllocatorTest,
+     PooledTensorAllocatorGrowsWhenReleasedCudaBlockIsTooSmall) {
+  if (!HasUsableCudaDevice()) {
+    GTEST_SKIP() << "CUDA tensor allocation is unavailable";
+  }
+
+  PooledTensorAllocator allocator;
+
+  void* small_data = nullptr;
+  {
+    Tensor small =
+        Tensor::Allocate(MakeCudaDescWithShape({4, 3, 2, 2}), allocator);
+    small_data = small.data();
+    EXPECT_EQ(small.capacity_bytes(), 192U);
+  }
+
+  Tensor larger =
+      Tensor::Allocate(MakeCudaDescWithShape({8, 3, 2, 2}), allocator);
   EXPECT_NE(larger.data(), nullptr);
+  EXPECT_NE(larger.data(), small_data);
   EXPECT_EQ(larger.bytes(), 384U);
   EXPECT_EQ(larger.capacity_bytes(), 384U);
-  EXPECT_EQ(buffer.capacity_bytes(), 384U);
   EXPECT_EQ(cudaMemset(larger.data(), 0, larger.bytes()), cudaSuccess);
 }
 
-TEST(CudaTensorAllocatorTest,
-     TensorBufferKeepsCapacityStableAcrossLargerBatches) {
+TEST(CudaTensorAllocatorTest, PooledTensorAllocatorSelectsAdapterByDevice) {
   if (!HasUsableCudaDevice()) {
     GTEST_SKIP() << "CUDA tensor allocation is unavailable";
   }
 
-  TensorBuffer buffer;
-
-  Tensor warmup = buffer.Ensure(MakeCudaDescWithShape({32, 3, 2, 2}));
-  void* warmup_data = warmup.data();
-  EXPECT_EQ(warmup.bytes(), 1536U);
-  EXPECT_EQ(warmup.capacity_bytes(), 1536U);
-
-  for (int64_t batch : {1, 2, 4, 8, 16, 32}) {
-    Tensor tensor = buffer.Ensure(MakeCudaDescWithShape({batch, 3, 2, 2}));
-    EXPECT_EQ(tensor.data(), warmup_data);
-    EXPECT_EQ(tensor.bytes(),
-              static_cast<std::size_t>(batch * 3 * 2 * 2 * sizeof(float)));
-    EXPECT_EQ(tensor.capacity_bytes(), 1536U);
-    EXPECT_EQ(buffer.capacity_bytes(), 1536U);
-  }
-
-  Tensor grown = buffer.Ensure(MakeCudaDescWithShape({64, 3, 2, 2}));
-  void* grown_data = grown.data();
-  EXPECT_NE(grown_data, nullptr);
-  EXPECT_EQ(grown.bytes(), 3072U);
-  EXPECT_EQ(grown.capacity_bytes(), 3072U);
-  EXPECT_EQ(buffer.capacity_bytes(), 3072U);
-
-  Tensor last;
-  for (int64_t batch : {48, 17, 1, 64}) {
-    last = buffer.Ensure(MakeCudaDescWithShape({batch, 3, 2, 2}));
-    EXPECT_EQ(last.data(), grown_data);
-    EXPECT_EQ(last.bytes(),
-              static_cast<std::size_t>(batch * 3 * 2 * 2 * sizeof(float)));
-    EXPECT_EQ(last.capacity_bytes(), 3072U);
-    EXPECT_EQ(buffer.capacity_bytes(), 3072U);
-  }
-
-  EXPECT_EQ(cudaMemset(last.data(), 0, last.bytes()), cudaSuccess);
-}
-
-TEST(CudaTensorAllocatorTest,
-     TensorBufferDefaultAllocatorSelectsAdapterByDevice) {
-  if (!HasUsableCudaDevice()) {
-    GTEST_SKIP() << "CUDA tensor allocation is unavailable";
-  }
-
-  TensorBuffer buffer;
+  PooledTensorAllocator allocator;
 
   TensorDesc host_desc = MakeCudaDesc();
   host_desc.device = Device{DeviceType::kCpu, 0};
-  Tensor host = buffer.Ensure(host_desc);
+  Tensor host = Tensor::Allocate(host_desc, allocator);
   EXPECT_EQ(host.device().type, DeviceType::kCpu);
 
-  Tensor cuda = buffer.Ensure(MakeCudaDesc());
+  Tensor cuda = Tensor::Allocate(MakeCudaDesc(), allocator);
   EXPECT_EQ(cuda.device().type, DeviceType::kCuda);
   EXPECT_EQ(cuda.device().id, 0);
   EXPECT_EQ(cuda.bytes(), 48U);
@@ -221,7 +248,7 @@ TEST(CudaTensorAllocatorTest, RejectsInvalidCudaAllocationRequests) {
 
   desc = MakeCudaDesc();
   desc.device = Device{DeviceType::kCuda, -1};
-  TensorAllocator allocator;
+  DirectTensorAllocator allocator;
   EXPECT_THROW(static_cast<void>(allocator.Allocate(desc)),
                std::invalid_argument);
 }

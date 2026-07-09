@@ -161,6 +161,25 @@ RawImageBatch MakeRawImageBatch(std::vector<RawImage> images) {
 
 }  // namespace
 
+ImageSize ResizeShortSideSize(ImageSize input_size, int short_side) {
+  ValidateSize(input_size, "ResizeShortSide input size");
+  if (short_side <= 0) {
+    throw std::invalid_argument("ResizeShortSide short side must be positive");
+  }
+
+  if (input_size.width <= input_size.height) {
+    const int height = std::max(
+        1, static_cast<int>(std::round(static_cast<double>(input_size.height) *
+                                       short_side / input_size.width)));
+    return ImageSize{short_side, height};
+  }
+
+  const int width = std::max(
+      1, static_cast<int>(std::round(static_cast<double>(input_size.width) *
+                                     short_side / input_size.height)));
+  return ImageSize{width, short_side};
+}
+
 bool GeometryTrace::empty() const { return steps_.empty(); }
 
 std::size_t GeometryTrace::size() const { return steps_.size(); }
@@ -303,6 +322,19 @@ const GeometryTrace& GeometryResult::trace(std::size_t index) const {
   return traces_.at(index);
 }
 
+ImageSize GeometryResult::original_size(std::size_t index) const {
+  const RawImage& image = images_.image(index);
+  const GeometryTrace& geometry_trace = traces_.at(index);
+  if (geometry_trace.empty()) {
+    return image.size();
+  }
+  return geometry_trace.step(0).before_size;
+}
+
+ImageSize GeometryResult::transformed_size(std::size_t index) const {
+  return images_.image(index).size();
+}
+
 GeometryTransformer::GeometryTransformer() {
 #if defined(MW_INFER_HAS_OPENCV_GEOMETRY_ADAPTER)
   AddAdapter(CreateOpenCvMatGeometryAdapter());
@@ -352,6 +384,31 @@ GeometryResult GeometryTransformer::Resize(GeometryResult result,
 GeometryResult GeometryTransformer::Resize(RawImageBatch images, ImageSize size,
                                            Interpolation interpolation) const {
   return this->Resize(GeometryResult(std::move(images)), size, interpolation);
+}
+
+GeometryResult GeometryTransformer::ResizeShortSide(
+    GeometryResult result, int short_side, Interpolation interpolation) const {
+  std::vector<RawImage> output_images;
+  output_images.reserve(result.size());
+  std::vector<GeometryTrace> traces = result.traces();
+  const std::vector<RawImage>& input_images = result.images().images();
+  for (std::size_t index = 0; index < input_images.size(); ++index) {
+    const RawImage& image = input_images[index];
+    const ImageSize before_size = image.size();
+    const ImageSize resized_size = ResizeShortSideSize(before_size, short_side);
+
+    const GeometryAdapter& adapter = SelectAdapter(image);
+    output_images.push_back(adapter.Resize(image, resized_size, interpolation));
+    traces[index].AddResize(before_size, resized_size);
+  }
+  return GeometryResult(MakeRawImageBatch(std::move(output_images)),
+                        std::move(traces));
+}
+
+GeometryResult GeometryTransformer::ResizeShortSide(
+    RawImageBatch images, int short_side, Interpolation interpolation) const {
+  return this->ResizeShortSide(GeometryResult(std::move(images)), short_side,
+                               interpolation);
 }
 
 GeometryResult GeometryTransformer::Pad(GeometryResult result, Padding padding,

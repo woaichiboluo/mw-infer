@@ -103,15 +103,19 @@ TEST(OpenCvImageToTensorTest, ConvertsToFloat16WhenModelInputRequiresIt) {
 
 TEST(OpenCvImageToTensorTest, ReusesBuffer) {
   RawImageBatch images(std::vector<cv::Mat>{MakeTestMat()});
-  TensorBuffer buffer;
+  PooledTensorAllocator allocator;
   const TensorInfo input = MakeInput({-1, 3, -1, -1});
 
-  Tensor first = ToTensor(images, Device{DeviceType::kCpu, 0}, input, buffer);
-  void* first_data = first.data();
-  Tensor second = ToTensor(images, Device{DeviceType::kCpu, 0}, input, buffer);
+  void* first_data = nullptr;
+  {
+    Tensor first = ToTensor(images, Device{DeviceType::kCpu, 0}, input,
+                            TensorLayout::kBchw, allocator);
+    first_data = first.data();
+  }
+  Tensor second = ToTensor(images, Device{DeviceType::kCpu, 0}, input,
+                           TensorLayout::kBchw, allocator);
 
   EXPECT_EQ(second.data(), first_data);
-  EXPECT_EQ(buffer.capacity_bytes(), first.capacity_bytes());
 }
 
 }  // namespace

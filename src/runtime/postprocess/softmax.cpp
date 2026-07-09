@@ -9,7 +9,7 @@ namespace mw::infer {
 
 #if defined(MW_INFER_HAS_CUDA_POSTPROCESS)
 namespace postprocess_internal {
-Tensor RunSoftmaxOnDevice(const Tensor& logits);
+Tensor RunSoftmaxOnDevice(const Tensor& logits, TensorAllocator& allocator);
 }  // namespace postprocess_internal
 #endif
 
@@ -50,8 +50,9 @@ TensorDesc MakeOutputDesc(const Tensor& logits) {
   return desc;
 }
 
-Tensor RunSoftmaxOnHost(const Tensor& logits, MatrixShape shape) {
-  Tensor output = Tensor::Allocate(MakeOutputDesc(logits));
+Tensor RunSoftmaxOnHost(const Tensor& logits, MatrixShape shape,
+                        TensorAllocator& allocator) {
+  Tensor output = Tensor::Allocate(MakeOutputDesc(logits), allocator);
   const auto* input = static_cast<const float*>(logits.data());
   auto* result = static_cast<float*>(output.data());
   for (int64_t row = 0; row < shape.rows; ++row) {
@@ -76,14 +77,14 @@ Tensor RunSoftmaxOnHost(const Tensor& logits, MatrixShape shape) {
 
 }  // namespace
 
-Tensor Softmax(const Tensor& logits) {
+Tensor Softmax(const Tensor& logits, TensorAllocator& allocator) {
   const MatrixShape shape = ValidateLogits(logits);
   if (logits.device().type == DeviceType::kCpu) {
-    return RunSoftmaxOnHost(logits, shape);
+    return RunSoftmaxOnHost(logits, shape, allocator);
   }
   if (logits.device().type == DeviceType::kCuda) {
 #if defined(MW_INFER_HAS_CUDA_POSTPROCESS)
-    return postprocess_internal::RunSoftmaxOnDevice(logits);
+    return postprocess_internal::RunSoftmaxOnDevice(logits, allocator);
 #else
     throw std::runtime_error("CUDA postprocess is unavailable in this build");
 #endif

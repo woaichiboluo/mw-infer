@@ -11,7 +11,8 @@ namespace mw::infer {
 
 #if defined(MW_INFER_HAS_CUDA_TENSOR_OPS)
 namespace tensor_internal {
-Tensor RunGatherRowsOnDevice(const Tensor& data, const Tensor& indices);
+Tensor RunGatherRowsOnDevice(const Tensor& data, const Tensor& indices,
+                             TensorAllocator& allocator);
 }  // namespace tensor_internal
 #endif
 
@@ -32,11 +33,10 @@ std::string MakeOutputName(const Tensor& data) {
 }
 
 std::size_t RowBytes(const Tensor& data) {
-  std::size_t row_elements = 1;
-  for (std::size_t index = 1; index < data.shape().size(); ++index) {
-    row_elements *= static_cast<std::size_t>(data.shape()[index]);
-  }
-  return row_elements * DataTypeSize(data.data_type());
+  TensorDesc desc;
+  desc.info.data_type = data.data_type();
+  desc.info.shape.assign(data.shape().begin() + 1, data.shape().end());
+  return TensorBytes(desc);
 }
 
 GatherRowsLayout ValidateInputs(const Tensor& data, const Tensor& indices) {
@@ -66,9 +66,9 @@ GatherRowsLayout ValidateInputs(const Tensor& data, const Tensor& indices) {
   GatherRowsLayout layout;
   layout.row_count = data.shape()[0];
   layout.selected_count = indices.shape()[0];
-  if (layout.row_count <= 0 || layout.selected_count <= 0) {
+  if (layout.row_count < 0 || layout.selected_count < 0) {
     throw std::invalid_argument(
-        "GatherRows tensor dimensions must be positive");
+        "GatherRows tensor dimensions must be non-negative");
   }
   layout.row_bytes = RowBytes(data);
   layout.output_shape = data.shape();
@@ -97,11 +97,17 @@ void ValidateHostIndices(const int64_t* indices, int64_t selected_count,
 }
 
 Tensor RunGatherRowsOnHost(const Tensor& data, const Tensor& indices,
-                           const GatherRowsLayout& layout) {
+                           const GatherRowsLayout& layout,
+                           TensorAllocator& allocator) {
   const auto* index_data = static_cast<const int64_t*>(indices.data());
   ValidateHostIndices(index_data, layout.selected_count, layout.row_count);
 
-  Tensor output = Tensor::Allocate(MakeOutputDesc(data, layout.output_shape));
+  Tensor output =
+      Tensor::Allocate(MakeOutputDesc(data, layout.output_shape), allocator);
+  if (layout.row_bytes == 0 || layout.selected_count == 0) {
+    return output;
+  }
+
   const auto* input_bytes = static_cast<const std::uint8_t*>(data.data());
   auto* output_bytes = static_cast<std::uint8_t*>(output.data());
   for (int64_t output_row = 0; output_row < layout.selected_count;
@@ -117,14 +123,15 @@ Tensor RunGatherRowsOnHost(const Tensor& data, const Tensor& indices,
 
 }  // namespace
 
-Tensor GatherRows(const Tensor& data, const Tensor& indices) {
+Tensor GatherRows(const Tensor& data, const Tensor& indices,
+                  TensorAllocator& allocator) {
   const GatherRowsLayout layout = ValidateInputs(data, indices);
   if (data.device().type == DeviceType::kCpu) {
-    return RunGatherRowsOnHost(data, indices, layout);
+    return RunGatherRowsOnHost(data, indices, layout, allocator);
   }
   if (data.device().type == DeviceType::kCuda) {
 #if defined(MW_INFER_HAS_CUDA_TENSOR_OPS)
-    return tensor_internal::RunGatherRowsOnDevice(data, indices);
+    return tensor_internal::RunGatherRowsOnDevice(data, indices, allocator);
 #else
     throw std::runtime_error("CUDA tensor ops are unavailable in this build");
 #endif
@@ -132,8 +139,9 @@ Tensor GatherRows(const Tensor& data, const Tensor& indices) {
   throw std::invalid_argument("GatherRows tensor device is unsupported");
 }
 
-Tensor Tensor::GatherRows(const Tensor& indices) const {
-  return mw::infer::GatherRows(*this, indices);
+Tensor Tensor::GatherRows(const Tensor& indices,
+                          TensorAllocator& allocator) const {
+  return mw::infer::GatherRows(*this, indices, allocator);
 }
 
 }  // namespace mw::infer

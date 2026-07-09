@@ -112,22 +112,23 @@ TEST(ImageToTensorConverterTest, UsesModelInputDataType) {
   EXPECT_EQ(static_cast<uint8_t*>(tensor.data())[0], 255);
 }
 
-TEST(ImageToTensorConverterTest, ReusesTensorBufferWhenProvided) {
+TEST(ImageToTensorConverterTest, ReusesPooledAllocatorWhenProvided) {
   ImageToTensorConverter converter = MakeConverter();
   RawImageBatch images({MakeRawImage(ImageMemoryKind::kHost)});
-  TensorBuffer buffer;
+  PooledTensorAllocator allocator;
   const TensorInfo input = MakeInput();
 
-  Tensor first =
-      converter.Convert(images, Device{DeviceType::kCpu, 0}, input, buffer);
-  void* first_data = first.data();
+  void* first_data = nullptr;
+  {
+    Tensor first = converter.Convert(images, Device{DeviceType::kCpu, 0}, input,
+                                     TensorLayout::kBchw, allocator);
+    first_data = first.data();
+  }
 
-  Tensor second =
-      converter.Convert(images, Device{DeviceType::kCpu, 0}, input, buffer);
+  Tensor second = converter.Convert(images, Device{DeviceType::kCpu, 0}, input,
+                                    TensorLayout::kBchw, allocator);
 
   EXPECT_EQ(second.data(), first_data);
-  EXPECT_EQ(second.capacity_bytes(), first.capacity_bytes());
-  EXPECT_EQ(buffer.capacity_bytes(), first.capacity_bytes());
   EXPECT_FLOAT_EQ(static_cast<float*>(second.data())[0], 1.25F);
 }
 

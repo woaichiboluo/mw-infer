@@ -24,7 +24,9 @@ Tensor MakeCpuTensor(std::vector<int64_t> shape, const std::vector<float>& data,
   desc.info.shape = std::move(shape);
   desc.device = Device{DeviceType::kCpu, 0};
   Tensor tensor = Tensor::Allocate(std::move(desc));
-  std::memcpy(tensor.data(), data.data(), tensor.bytes());
+  if (tensor.bytes() > 0) {
+    std::memcpy(tensor.data(), data.data(), tensor.bytes());
+  }
   return tensor;
 }
 
@@ -81,6 +83,19 @@ TEST(NmsTest, RespectsMaxOutputBoxes) {
   EXPECT_EQ(CopyCpuIndices(keep), std::vector<int64_t>({0}));
 }
 
+TEST(NmsTest, AllowsEmptyInputs) {
+  Tensor boxes = MakeCpuTensor({0, 4}, {}, "boxes");
+  Tensor scores = MakeCpuTensor({0}, {}, "scores");
+
+  Tensor keep = Nms(boxes, scores, 0.5F);
+
+  EXPECT_FALSE(keep.empty());
+  EXPECT_EQ(keep.shape(), std::vector<int64_t>({0}));
+  EXPECT_EQ(keep.element_count(), 0U);
+  EXPECT_EQ(keep.bytes(), 0U);
+  EXPECT_EQ(CopyCpuIndices(keep), std::vector<int64_t>({}));
+}
+
 TEST(NmsTest, IndicesGatherSelectedRows) {
   Tensor boxes = MakeCpuTensor({3, 4}, TestBoxes(), "boxes");
   Tensor scores = MakeCpuTensor({3}, TestScores(), "scores");
@@ -124,9 +139,11 @@ Tensor MakeCudaTensor(std::vector<int64_t> shape,
   desc.info.shape = std::move(shape);
   desc.device = Device{DeviceType::kCuda, 0};
   Tensor tensor = Tensor::Allocate(std::move(desc));
-  EXPECT_EQ(cudaMemcpy(tensor.data(), data.data(), tensor.bytes(),
-                       cudaMemcpyHostToDevice),
-            cudaSuccess);
+  if (tensor.bytes() > 0) {
+    EXPECT_EQ(cudaMemcpy(tensor.data(), data.data(), tensor.bytes(),
+                         cudaMemcpyHostToDevice),
+              cudaSuccess);
+  }
   return tensor;
 }
 
@@ -134,9 +151,11 @@ std::vector<int64_t> CopyCudaIndices(const Tensor& tensor) {
   EXPECT_EQ(tensor.device().type, DeviceType::kCuda);
   EXPECT_EQ(tensor.data_type(), DataType::kInt64);
   std::vector<int64_t> values(tensor.element_count());
-  EXPECT_EQ(cudaMemcpy(values.data(), tensor.data(), tensor.bytes(),
-                       cudaMemcpyDeviceToHost),
-            cudaSuccess);
+  if (tensor.bytes() > 0) {
+    EXPECT_EQ(cudaMemcpy(values.data(), tensor.data(), tensor.bytes(),
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+  }
   return values;
 }
 

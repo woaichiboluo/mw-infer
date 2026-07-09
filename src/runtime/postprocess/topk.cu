@@ -110,7 +110,8 @@ __global__ void TopKKernel(const float* scores, float* top_scores,
 
 }  // namespace
 
-TopKResult RunTopKOnDevice(const Tensor& scores, int64_t k) {
+TopKResult RunTopKOnDevice(const Tensor& scores, int64_t k,
+                           TensorAllocator& allocator) {
   const MatrixShape shape = CheckedMatrixShape(scores);
   if (k > std::numeric_limits<int>::max()) {
     throw std::invalid_argument("CUDA postprocess k exceeds int range");
@@ -119,9 +120,9 @@ TopKResult RunTopKOnDevice(const Tensor& scores, int64_t k) {
 
   const std::vector<int64_t> output_shape = MakeOutputShape(shape, k);
   Tensor top_scores =
-      Tensor::Allocate(MakeFloatDesc(output_shape, scores.device()));
+      Tensor::Allocate(MakeFloatDesc(output_shape, scores.device()), allocator);
   Tensor top_indices =
-      Tensor::Allocate(MakeIndexDesc(output_shape, scores.device()));
+      Tensor::Allocate(MakeIndexDesc(output_shape, scores.device()), allocator);
 
   TopKKernel<<<shape.rows, 1>>>(static_cast<const float*>(scores.data()),
                                 static_cast<float*>(top_scores.data()),

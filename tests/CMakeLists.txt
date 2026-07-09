@@ -56,7 +56,15 @@ mw_infer_add_gtest(mw_infer_preprocess_test
 mw_infer_add_gtest(mw_infer_classification_postprocess_test
                    runtime/postprocess/classification_test.cpp
                    runtime_postprocess)
+mw_infer_add_gtest(mw_infer_label_map_test
+                   runtime/postprocess/label_map_test.cc runtime_postprocess)
 mw_infer_add_gtest(mw_infer_nms_test runtime/postprocess/nms_test.cpp
+                   runtime_postprocess)
+mw_infer_add_gtest(mw_infer_segmentation_test
+                   runtime/postprocess/segmentation_test.cc
+                   runtime_postprocess)
+mw_infer_add_gtest(mw_infer_yolo_decode_test
+                   runtime/postprocess/yolo_decode_test.cpp
                    runtime_postprocess)
 
 if(MW_INFER_FEATURE_OPENCV_ADAPTER_STATUS STREQUAL "enabled")
@@ -88,6 +96,12 @@ if(MW_INFER_FEATURE_ONNXRUNTIME_BACKEND_STATUS STREQUAL "enabled")
   mw_infer_add_gtest(mw_infer_onnx_backend_test
                      runtime/backend/onnx_backend_test.cpp runtime_backend)
   mw_infer_copy_onnxruntime_dlls(mw_infer_onnx_backend_test)
+  if(MW_INFER_FEATURE_OPENCV_ADAPTER_STATUS STREQUAL "enabled")
+    mw_infer_add_gtest(mw_infer_onnx_dynamic_image_pipeline_test
+                       runtime/backend/onnx_dynamic_image_pipeline_test.cc
+                       runtime_backend)
+    mw_infer_copy_onnxruntime_dlls(mw_infer_onnx_dynamic_image_pipeline_test)
+  endif()
 endif()
 
 if(MW_INFER_FEATURE_CUDA_TENSOR_STATUS STREQUAL "enabled")

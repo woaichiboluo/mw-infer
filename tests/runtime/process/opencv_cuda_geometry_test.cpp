@@ -47,6 +47,30 @@ TEST(OpenCvCudaGeometryTest, ResizesGpuMatBatchAndRestoresPoint) {
   EXPECT_FLOAT_EQ(restored.y, 5.0F);
 }
 
+TEST(OpenCvCudaGeometryTest, ResizesGpuMatShortSide) {
+  if (!HasUsableCudaDevice()) {
+    GTEST_SKIP() << "OpenCV CUDA device is unavailable";
+  }
+
+  GeometryTransformer transformer;
+  RawImageBatch raw_images(
+      std::vector<cv::cuda::GpuMat>{cv::cuda::GpuMat(10, 20, CV_8UC3)});
+
+  GeometryResult resized =
+      transformer.ResizeShortSide(raw_images, 5, Interpolation::kNearest);
+
+  const cv::cuda::GpuMat& output =
+      GetOpenCvCudaGpuMat(resized.images().image(0));
+  EXPECT_EQ(output.cols, 10);
+  EXPECT_EQ(output.rows, 5);
+  EXPECT_EQ(output.type(), CV_8UC3);
+
+  const GeometryStep& step = resized.trace(0).step(0);
+  EXPECT_EQ(step.kind, GeometryStepKind::kResize);
+  EXPECT_EQ(step.after_size.width, 10);
+  EXPECT_EQ(step.after_size.height, 5);
+}
+
 TEST(OpenCvCudaGeometryTest, LetterBoxesGpuMat) {
   if (!HasUsableCudaDevice()) {
     GTEST_SKIP() << "OpenCV CUDA device is unavailable";

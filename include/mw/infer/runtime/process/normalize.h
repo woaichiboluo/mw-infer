@@ -10,7 +10,8 @@ namespace mw::infer {
 
 Tensor Normalize(const Tensor& input, const std::vector<float>& mean,
                  const std::vector<float>& stddev, float scale = 1.0F,
-                 TensorLayout layout = TensorLayout::kBchw);
+                 TensorLayout layout = TensorLayout::kBchw,
+                 TensorAllocator& allocator = TensorAllocator::Default());
 
 }  // namespace mw::infer
 

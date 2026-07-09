@@ -12,7 +12,8 @@ namespace mw::infer {
 
 #if defined(MW_INFER_HAS_CUDA_POSTPROCESS)
 namespace postprocess_internal {
-TopKResult RunTopKOnDevice(const Tensor& scores, int64_t k);
+TopKResult RunTopKOnDevice(const Tensor& scores, int64_t k,
+                           TensorAllocator& allocator);
 }  // namespace postprocess_internal
 #endif
 
@@ -93,12 +94,13 @@ std::vector<int64_t> MakeScoreOrder(const float* scores, int64_t columns) {
   return order;
 }
 
-TopKResult RunTopKOnHost(const Tensor& scores, MatrixShape shape, int64_t k) {
+TopKResult RunTopKOnHost(const Tensor& scores, MatrixShape shape, int64_t k,
+                         TensorAllocator& allocator) {
   const std::vector<int64_t> output_shape = MakeTopKShape(shape, k);
   Tensor top_scores =
-      Tensor::Allocate(MakeFloatDesc(output_shape, scores.device()));
+      Tensor::Allocate(MakeFloatDesc(output_shape, scores.device()), allocator);
   Tensor top_indices =
-      Tensor::Allocate(MakeIndexDesc(output_shape, scores.device()));
+      Tensor::Allocate(MakeIndexDesc(output_shape, scores.device()), allocator);
 
   const auto* input = static_cast<const float*>(scores.data());
   auto* output_scores = static_cast<float*>(top_scores.data());
@@ -122,15 +124,15 @@ TopKResult RunTopKOnHost(const Tensor& scores, MatrixShape shape, int64_t k) {
 
 }  // namespace
 
-TopKResult TopK(const Tensor& scores, int64_t k) {
+TopKResult TopK(const Tensor& scores, int64_t k, TensorAllocator& allocator) {
   const MatrixShape shape = ValidateScores(scores);
   ValidateK(k, shape.columns);
   if (scores.device().type == DeviceType::kCpu) {
-    return RunTopKOnHost(scores, shape, k);
+    return RunTopKOnHost(scores, shape, k, allocator);
   }
   if (scores.device().type == DeviceType::kCuda) {
 #if defined(MW_INFER_HAS_CUDA_POSTPROCESS)
-    return postprocess_internal::RunTopKOnDevice(scores, k);
+    return postprocess_internal::RunTopKOnDevice(scores, k, allocator);
 #else
     throw std::runtime_error("CUDA postprocess is unavailable in this build");
 #endif

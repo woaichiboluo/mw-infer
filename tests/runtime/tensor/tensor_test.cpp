@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -35,15 +36,16 @@ class CpuOnlyTensorAllocationAdapter final : public TensorAllocationAdapter {
     return device.type == DeviceType::kCpu;
   }
 
-  Tensor Allocate(TensorDesc) const override {
+  Tensor Allocate(TensorDesc) override {
     throw std::logic_error("CPU-only test adapter should not allocate");
   }
 };
 
-TensorAllocator MakeCpuOnlyTestAllocator() {
+std::vector<std::unique_ptr<TensorAllocationAdapter>>
+MakeCpuOnlyTestAdapters() {
   std::vector<std::unique_ptr<TensorAllocationAdapter>> adapters;
   adapters.push_back(std::make_unique<CpuOnlyTensorAllocationAdapter>());
-  return TensorAllocator(std::move(adapters));
+  return adapters;
 }
 
 TEST(TensorTest, ComputesShapeAndTypeSizes) {
@@ -52,8 +54,75 @@ TEST(TensorTest, ComputesShapeAndTypeSizes) {
   EXPECT_EQ(DataTypeSize(DataType::kFloat32), 4U);
   EXPECT_EQ(DataTypeSize(DataType::kInt64), 8U);
   EXPECT_EQ(DataTypeSize(DataType::kFloat64), 8U);
+  EXPECT_EQ(ElementCount({}), 1U);
+  EXPECT_EQ(ElementCount({2, 0, 3}), 0U);
   EXPECT_EQ(ElementCount({1, 3, 2, 2}), 12U);
   EXPECT_EQ(TensorBytes(MakeDesc()), 48U);
+}
+
+TEST(TensorTest, ParsesAndFormatsDevices) {
+  Device default_device;
+  EXPECT_EQ(default_device.type, DeviceType::kCpu);
+  EXPECT_EQ(default_device.id, 0);
+  EXPECT_EQ(default_device.ToString(), "cpu");
+
+  Device cpu("cpu");
+  EXPECT_EQ(cpu.type, DeviceType::kCpu);
+  EXPECT_EQ(cpu.id, 0);
+  EXPECT_EQ(cpu.ToString(), "cpu");
+
+  Device cuda("cuda");
+  EXPECT_EQ(cuda.type, DeviceType::kCuda);
+  EXPECT_EQ(cuda.id, 0);
+  EXPECT_EQ(cuda.ToString(), "cuda:0");
+
+  Device cuda_with_id("cuda:2");
+  EXPECT_EQ(cuda_with_id.type, DeviceType::kCuda);
+  EXPECT_EQ(cuda_with_id.id, 2);
+  EXPECT_EQ(cuda_with_id.ToString(), "cuda:2");
+
+  EXPECT_EQ(Device(DeviceType::kCpu, 3).ToString(), "cpu");
+  EXPECT_EQ(Device(DeviceType::kCuda, 4).ToString(), "cuda:4");
+}
+
+TEST(TensorTest, RejectsInvalidDeviceStrings) {
+  EXPECT_THROW(static_cast<void>(Device("gpu")), std::invalid_argument);
+  EXPECT_THROW(static_cast<void>(Device("cuda:")), std::invalid_argument);
+  EXPECT_THROW(static_cast<void>(Device("cuda:-1")), std::invalid_argument);
+  EXPECT_THROW(static_cast<void>(Device("cuda:abc")), std::invalid_argument);
+  EXPECT_THROW(static_cast<void>(Device("cpu:0")), std::invalid_argument);
+}
+
+TEST(TensorTest, RejectsShapeAndByteSizeOverflow) {
+  EXPECT_THROW(
+      static_cast<void>(ElementCount({std::numeric_limits<int64_t>::max(), 3})),
+      std::invalid_argument);
+
+  TensorDesc desc = MakeDesc();
+  desc.info.shape = {
+      static_cast<int64_t>(std::numeric_limits<std::size_t>::max() /
+                           DataTypeSize(desc.info.data_type)) +
+      1};
+  EXPECT_THROW(static_cast<void>(TensorBytes(desc)), std::invalid_argument);
+}
+
+TEST(TensorTest, SupportsScalarAndZeroSizedShapes) {
+  TensorDesc scalar_desc = MakeDescWithShape({});
+  Tensor scalar = Tensor::Allocate(scalar_desc);
+  EXPECT_FALSE(scalar.empty());
+  EXPECT_EQ(scalar.element_count(), 1U);
+  EXPECT_EQ(scalar.bytes(), sizeof(float));
+
+  TensorDesc zero_desc = MakeDescWithShape({0, 3});
+  Tensor zero = Tensor::Allocate(zero_desc);
+  EXPECT_FALSE(zero.empty());
+  EXPECT_EQ(zero.element_count(), 0U);
+  EXPECT_EQ(zero.bytes(), 0U);
+
+  Tensor external_zero = Tensor::FromExternal(zero_desc, nullptr, 0);
+  EXPECT_FALSE(external_zero.empty());
+  EXPECT_EQ(external_zero.element_count(), 0U);
+  EXPECT_EQ(external_zero.bytes(), 0U);
 }
 
 TEST(TensorTest, WrapsExternalBuffer) {
@@ -89,6 +158,21 @@ TEST(TensorTest, AllocatesHostTensor) {
   auto* values = static_cast<float*>(tensor.data());
   values[0] = 1.25F;
   EXPECT_FLOAT_EQ(values[0], 1.25F);
+}
+
+TEST(TensorTest, ProvidesTypedDataAccess) {
+  Tensor tensor = Tensor::Allocate(MakeDesc());
+
+  float* values = tensor.data<float>();
+  values[0] = 1.25F;
+
+  const Tensor& const_tensor = tensor;
+  EXPECT_EQ(const_tensor.data<float>(), values);
+  EXPECT_FLOAT_EQ(const_tensor.data<float>()[0], 1.25F);
+  EXPECT_THROW(static_cast<void>(tensor.data<int64_t>()),
+               std::invalid_argument);
+  EXPECT_THROW(static_cast<void>(Tensor{}.data<float>()),
+               std::invalid_argument);
 }
 
 TEST(TensorTest, AllocatesThroughTensorInterface) {
@@ -138,68 +222,102 @@ TEST(TensorTest, CopiesTensorToCpuDevice) {
   EXPECT_FLOAT_EQ(copy_values[0], 0.0F);
 }
 
-TEST(TensorTest, TensorBufferReusesAndGrowsLikeVectorReserve) {
-  TensorBuffer buffer;
+TEST(TensorTest, CopiesHostValuesToVector) {
+  Tensor tensor = Tensor::Allocate(MakeDesc());
+  float* values = tensor.data<float>();
+  for (std::size_t index = 0; index < tensor.element_count(); ++index) {
+    values[index] = static_cast<float>(index);
+  }
 
-  Tensor first = buffer.Ensure(MakeDescWithShape({4, 3, 2, 2}));
-  void* first_data = first.data();
-  EXPECT_EQ(first.bytes(), 192U);
-  EXPECT_EQ(first.capacity_bytes(), 192U);
-  EXPECT_EQ(buffer.capacity_bytes(), 192U);
+  EXPECT_EQ(tensor.CopyToHostVector<float>(),
+            std::vector<float>({0.0F, 1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F, 7.0F,
+                                8.0F, 9.0F, 10.0F, 11.0F}));
+  EXPECT_THROW(static_cast<void>(tensor.CopyToHostVector<int64_t>()),
+               std::invalid_argument);
 
-  Tensor smaller = buffer.Ensure(MakeDescWithShape({2, 3, 2, 2}));
+  Tensor zero = Tensor::Allocate(MakeDescWithShape({0, 3}));
+  EXPECT_TRUE(zero.CopyToHostVector<float>().empty());
+}
+
+TEST(TensorTest, ReadsElementAtMultiDimensionalIndex) {
+  Tensor tensor = Tensor::Allocate(MakeDesc());
+  float* values = tensor.data<float>();
+  for (std::size_t index = 0; index < tensor.element_count(); ++index) {
+    values[index] = static_cast<float>(index);
+  }
+
+  EXPECT_FLOAT_EQ(tensor.At<float>({0, 0, 0, 0}), 0.0F);
+  EXPECT_FLOAT_EQ(tensor.At<float>({0, 1, 1, 0}), 6.0F);
+  EXPECT_FLOAT_EQ(tensor.At<float>({0, 2, 1, 1}), 11.0F);
+
+  Tensor scalar = Tensor::Allocate(MakeDescWithShape({}));
+  scalar.data<float>()[0] = 42.0F;
+  EXPECT_FLOAT_EQ(scalar.At<float>({}), 42.0F);
+}
+
+TEST(TensorTest, RejectsInvalidElementIndex) {
+  Tensor tensor = Tensor::Allocate(MakeDesc());
+
+  EXPECT_THROW(static_cast<void>(tensor.At<float>({0, 0, 0})),
+               std::invalid_argument);
+  EXPECT_THROW(static_cast<void>(tensor.At<float>({0, 3, 0, 0})),
+               std::invalid_argument);
+  EXPECT_THROW(static_cast<void>(tensor.At<float>({0, -1, 0, 0})),
+               std::invalid_argument);
+  EXPECT_THROW(static_cast<void>(tensor.At<int64_t>({0, 0, 0, 0})),
+               std::invalid_argument);
+  EXPECT_THROW(static_cast<void>(Tensor{}.At<float>({})),
+               std::invalid_argument);
+
+  Tensor zero = Tensor::Allocate(MakeDescWithShape({0, 3}));
+  EXPECT_THROW(static_cast<void>(zero.At<float>({0, 0})),
+               std::invalid_argument);
+}
+
+TEST(TensorTest, PooledTensorAllocatorReusesReleasedBlocks) {
+  PooledTensorAllocator allocator;
+
+  void* first_data = nullptr;
+  {
+    Tensor first = Tensor::Allocate(MakeDescWithShape({4, 3, 2, 2}), allocator);
+    first_data = first.data();
+    EXPECT_EQ(first.bytes(), 192U);
+    EXPECT_EQ(first.capacity_bytes(), 192U);
+  }
+
+  Tensor smaller = Tensor::Allocate(MakeDescWithShape({2, 3, 2, 2}), allocator);
   EXPECT_EQ(smaller.data(), first_data);
   EXPECT_EQ(smaller.bytes(), 96U);
   EXPECT_EQ(smaller.capacity_bytes(), 192U);
-  EXPECT_EQ(buffer.capacity_bytes(), 192U);
 
-  Tensor larger = buffer.Ensure(MakeDescWithShape({8, 3, 2, 2}));
+  Tensor active = Tensor::Allocate(MakeDescWithShape({2, 3, 2, 2}), allocator);
+  EXPECT_NE(active.data(), smaller.data());
+}
+
+TEST(TensorTest, PooledTensorAllocatorGrowsWhenReleasedBlockIsTooSmall) {
+  PooledTensorAllocator allocator;
+
+  void* small_data = nullptr;
+  {
+    Tensor small = Tensor::Allocate(MakeDescWithShape({4, 3, 2, 2}), allocator);
+    small_data = small.data();
+    EXPECT_EQ(small.capacity_bytes(), 192U);
+  }
+
+  Tensor larger = Tensor::Allocate(MakeDescWithShape({8, 3, 2, 2}), allocator);
   EXPECT_NE(larger.data(), nullptr);
+  EXPECT_NE(larger.data(), small_data);
   EXPECT_EQ(larger.bytes(), 384U);
   EXPECT_EQ(larger.capacity_bytes(), 384U);
-  EXPECT_EQ(buffer.capacity_bytes(), 384U);
 }
 
-TEST(TensorTest, TensorBufferKeepsCapacityStableAcrossLargerBatches) {
-  TensorBuffer buffer;
-
-  Tensor warmup = buffer.Ensure(MakeDescWithShape({32, 3, 2, 2}));
-  void* warmup_data = warmup.data();
-  EXPECT_EQ(warmup.bytes(), 1536U);
-  EXPECT_EQ(warmup.capacity_bytes(), 1536U);
-
-  for (int64_t batch : {1, 2, 4, 8, 16, 32}) {
-    Tensor tensor = buffer.Ensure(MakeDescWithShape({batch, 3, 2, 2}));
-    EXPECT_EQ(tensor.data(), warmup_data);
-    EXPECT_EQ(tensor.bytes(),
-              static_cast<std::size_t>(batch * 3 * 2 * 2 * sizeof(float)));
-    EXPECT_EQ(tensor.capacity_bytes(), 1536U);
-    EXPECT_EQ(buffer.capacity_bytes(), 1536U);
-  }
-
-  Tensor grown = buffer.Ensure(MakeDescWithShape({64, 3, 2, 2}));
-  void* grown_data = grown.data();
-  EXPECT_NE(grown_data, nullptr);
-  EXPECT_EQ(grown.bytes(), 3072U);
-  EXPECT_EQ(grown.capacity_bytes(), 3072U);
-  EXPECT_EQ(buffer.capacity_bytes(), 3072U);
-
-  for (int64_t batch : {48, 17, 1, 64}) {
-    Tensor tensor = buffer.Ensure(MakeDescWithShape({batch, 3, 2, 2}));
-    EXPECT_EQ(tensor.data(), grown_data);
-    EXPECT_EQ(tensor.bytes(),
-              static_cast<std::size_t>(batch * 3 * 2 * 2 * sizeof(float)));
-    EXPECT_EQ(tensor.capacity_bytes(), 3072U);
-    EXPECT_EQ(buffer.capacity_bytes(), 3072U);
-  }
-}
-
-TEST(TensorTest, TensorAllocatorRejectsUnsupportedDevice) {
-  TensorBuffer buffer(MakeCpuOnlyTestAllocator());
+TEST(TensorTest, DirectTensorAllocatorRejectsUnsupportedDevice) {
+  DirectTensorAllocator allocator(MakeCpuOnlyTestAdapters());
   TensorDesc desc = MakeDesc();
   desc.device = Device{DeviceType::kCuda, 0};
 
-  EXPECT_THROW(static_cast<void>(buffer.Ensure(desc)), std::invalid_argument);
+  EXPECT_THROW(static_cast<void>(allocator.Allocate(desc)),
+               std::invalid_argument);
 }
 
 TEST(TensorTest, KeepsOwnedBufferAliveWithCustomDeleter) {
@@ -296,13 +414,13 @@ TEST(TensorTest, RejectsEmptyDeleterForOwnedBuffer) {
 }
 
 TEST(TensorTest, RejectsInvalidTensorAllocatorAdapters) {
-  EXPECT_THROW(static_cast<void>(TensorAllocator(
+  EXPECT_THROW(static_cast<void>(DirectTensorAllocator(
                    std::vector<std::unique_ptr<TensorAllocationAdapter>>())),
                std::invalid_argument);
 
   std::vector<std::unique_ptr<TensorAllocationAdapter>> adapters;
   adapters.push_back(nullptr);
-  EXPECT_THROW(static_cast<void>(TensorAllocator(std::move(adapters))),
+  EXPECT_THROW(static_cast<void>(DirectTensorAllocator(std::move(adapters))),
                std::invalid_argument);
 }
 

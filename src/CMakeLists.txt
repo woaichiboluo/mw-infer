@@ -7,9 +7,12 @@ add_library(MwInferRuntime STATIC runtime/backend/backend.cpp
                                  runtime/process/geometry.cpp
                                  runtime/process/image_to_tensor.cpp
                                  runtime/process/normalize.cpp
+                                 runtime/postprocess/label_map.cc
                                  runtime/postprocess/nms.cpp
+                                 runtime/postprocess/segmentation.cc
                                  runtime/postprocess/softmax.cpp
-                                 runtime/postprocess/topk.cpp)
+                                 runtime/postprocess/topk.cpp
+                                 runtime/postprocess/yolo_decode.cpp)
 add_library(MwInfer::Runtime ALIAS MwInferRuntime)
 
 set_target_properties(MwInferRuntime PROPERTIES EXPORT_NAME Runtime)
@@ -134,8 +137,10 @@ if(TARGET CUDA::cudart)
                                           runtime/process/channel.cu
                                           runtime/process/normalize.cu
                                           runtime/postprocess/nms.cu
+                                          runtime/postprocess/segmentation.cu
                                           runtime/postprocess/softmax.cu
-                                          runtime/postprocess/topk.cu)
+                                          runtime/postprocess/topk.cu
+                                          runtime/postprocess/yolo_decode.cu)
     target_compile_definitions(MwInferRuntime
                                PUBLIC MW_INFER_HAS_CUDA_PREPROCESS=1
                                       MW_INFER_HAS_CUDA_POSTPROCESS=1

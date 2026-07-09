@@ -31,7 +31,7 @@ class HostTensorAllocationAdapter final : public TensorAllocationAdapter {
     return device.type == DeviceType::kCpu;
   }
 
-  Tensor Allocate(TensorDesc desc) const override {
+  Tensor Allocate(TensorDesc desc) override {
     return AllocateHostTensor(std::move(desc));
   }
 };

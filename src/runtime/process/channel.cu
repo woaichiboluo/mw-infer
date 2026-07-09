@@ -122,13 +122,14 @@ __global__ void ReorderChannelsKernel(const float* input, float* output,
 
 Tensor RunReorderChannelsOnDevice(const Tensor& input,
                                   const std::vector<int64_t>& order,
-                                  TensorLayout layout) {
+                                  TensorLayout layout,
+                                  TensorAllocator& allocator) {
   CheckCuda(cudaSetDevice(input.device().id), "cudaSetDevice");
 
   DeviceBuffer<int64_t> device_order(order.size());
   device_order.CopyFromHost(order.data());
 
-  Tensor output = Tensor::Allocate(MakeOutputDesc(input));
+  Tensor output = Tensor::Allocate(MakeOutputDesc(input), allocator);
   const ImageTensorShape shape = TensorShape(input, layout);
   const int layout_id = layout == TensorLayout::kBchw ? 0 : 1;
   ReorderChannelsKernel<<<GridBlocks(input.element_count()),

@@ -98,22 +98,6 @@ ONNXTensorElementDataType ToOrtDataType(DataType data_type) {
   throw std::invalid_argument("Tensor data type is unknown");
 }
 
-std::size_t RuntimeElementCount(const std::vector<int64_t>& shape) {
-  std::size_t count = 1;
-  for (int64_t dim : shape) {
-    if (dim <= 0) {
-      throw std::runtime_error("ONNX Runtime returned a dynamic output shape");
-    }
-    count *= static_cast<std::size_t>(dim);
-  }
-  return count;
-}
-
-std::size_t RuntimeTensorBytes(const TensorDesc& desc) {
-  return RuntimeElementCount(desc.info.shape) *
-         DataTypeSize(desc.info.data_type);
-}
-
 Ort::MemoryInfo MakeMemoryInfo(Device device) {
   if (device.type == DeviceType::kCpu) {
     return Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
@@ -479,7 +463,7 @@ class OnnxBackendSession {
       desc.info.shape = tensor_info.GetShape();
       desc.device = DeviceFromOrtValue(*output_value);
 
-      const std::size_t bytes = RuntimeTensorBytes(desc);
+      const std::size_t bytes = TensorBytes(desc);
       void* data = output_value->GetTensorMutableRawData();
       outputs.push_back(Tensor::FromExternal(
           std::move(desc), data, bytes, std::shared_ptr<void>(output_value)));

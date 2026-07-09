@@ -4,7 +4,6 @@
 #include <CLI/CLI.hpp>
 #include <exception>
 #include <filesystem>
-#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -40,40 +39,8 @@ std::string_view DataTypeName(mw::infer::DataType data_type) {
   return "unknown";
 }
 
-std::string DeviceName(mw::infer::Device device) {
-  switch (device.type) {
-    case mw::infer::DeviceType::kCpu:
-      return "cpu";
-    case mw::infer::DeviceType::kCuda:
-      return "cuda:" + std::to_string(device.id);
-  }
-  return "unknown";
-}
-
 std::string ShapeString(const std::vector<int64_t>& shape) {
   return fmt::format("[{}]", fmt::join(shape, ", "));
-}
-
-mw::infer::Device ParseDevice(const std::string& value) {
-  if (value == "cpu") {
-    return mw::infer::Device{mw::infer::DeviceType::kCpu, 0};
-  }
-  if (value == "cuda") {
-    return mw::infer::Device{mw::infer::DeviceType::kCuda, 0};
-  }
-
-  constexpr std::string_view kCudaPrefix = "cuda:";
-  if (value.rfind(kCudaPrefix, 0) == 0) {
-    const std::string id_text = value.substr(kCudaPrefix.size());
-    std::size_t parsed = 0;
-    const int device_id = std::stoi(id_text, &parsed);
-    if (parsed != id_text.size() || device_id < 0) {
-      throw std::invalid_argument("Invalid CUDA device: " + value);
-    }
-    return mw::infer::Device{mw::infer::DeviceType::kCuda, device_id};
-  }
-
-  throw std::invalid_argument("Unsupported device: " + value);
 }
 
 void PrintTensorInfos(const char* label,
@@ -115,7 +82,7 @@ int main(int argc, char** argv) {
 
   try {
     const std::filesystem::path model_path = arguments.model_path;
-    const mw::infer::Device device = ParseDevice(arguments.device);
+    const mw::infer::Device device(arguments.device);
 
     mw::infer::Model model = mw::infer::ModelFromPath(model_path);
     mw::infer::BackendPtr backend =
@@ -125,7 +92,7 @@ int main(int argc, char** argv) {
 
     fmt::print("model: {}\n", active_model.name);
     fmt::print("path: {}\n", model_path.string());
-    fmt::print("backend_device: {}\n", DeviceName(backend->execution_device()));
+    fmt::print("backend_device: {}\n", backend->execution_device().ToString());
     PrintTensorInfos("inputs", model_info.inputs);
     PrintTensorInfos("outputs", model_info.outputs);
   } catch (const std::exception& error) {

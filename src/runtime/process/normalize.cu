@@ -118,7 +118,7 @@ __global__ void NormalizeKernel(const float* input, float* output,
 
 Tensor RunNormalizeOnDevice(const Tensor& input, const std::vector<float>& mean,
                             const std::vector<float>& stddev, float scale,
-                            TensorLayout layout) {
+                            TensorLayout layout, TensorAllocator& allocator) {
   CheckCuda(cudaSetDevice(input.device().id), "cudaSetDevice");
 
   DeviceBuffer<float> device_mean(mean.size());
@@ -126,7 +126,7 @@ Tensor RunNormalizeOnDevice(const Tensor& input, const std::vector<float>& mean,
   device_mean.CopyFromHost(mean.data());
   device_stddev.CopyFromHost(stddev.data());
 
-  Tensor output = Tensor::Allocate(MakeOutputDesc(input));
+  Tensor output = Tensor::Allocate(MakeOutputDesc(input), allocator);
   const ImageTensorShape shape = TensorShape(input, layout);
   const int layout_id = layout == TensorLayout::kBchw ? 0 : 1;
   NormalizeKernel<<<GridBlocks(input.element_count()), kThreadsPerBlock>>>(

@@ -14,17 +14,17 @@ class TensorAllocationAdapter {
   virtual ~TensorAllocationAdapter() = default;
 
   virtual bool Supports(Device device) const = 0;
-  virtual Tensor Allocate(TensorDesc desc) const = 0;
+  virtual Tensor Allocate(TensorDesc desc) = 0;
 };
 
-class TensorAllocator {
+class DirectTensorAllocator final : public TensorAllocator {
  public:
-  TensorAllocator();
-  explicit TensorAllocator(
+  DirectTensorAllocator();
+  explicit DirectTensorAllocator(
       std::vector<std::unique_ptr<TensorAllocationAdapter>> adapters);
 
-  bool Supports(Device device) const;
-  Tensor Allocate(TensorDesc desc) const;
+  bool Supports(Device device) const override;
+  Tensor Allocate(TensorDesc desc) override;
 
  private:
   void AddAdapter(std::unique_ptr<TensorAllocationAdapter> adapter);
@@ -32,19 +32,25 @@ class TensorAllocator {
   std::vector<std::unique_ptr<TensorAllocationAdapter>> adapters_;
 };
 
-class TensorBuffer {
+class PooledTensorAllocator final : public TensorAllocator {
  public:
-  TensorBuffer() = default;
-  explicit TensorBuffer(TensorAllocator allocator);
+  PooledTensorAllocator();
+  explicit PooledTensorAllocator(std::unique_ptr<TensorAllocator> upstream);
+  ~PooledTensorAllocator() override;
+  PooledTensorAllocator(const PooledTensorAllocator&) = delete;
+  PooledTensorAllocator& operator=(const PooledTensorAllocator&) = delete;
+  PooledTensorAllocator(PooledTensorAllocator&&) = delete;
+  PooledTensorAllocator& operator=(PooledTensorAllocator&&) = delete;
 
-  const Tensor& tensor() const;
-  std::size_t capacity_bytes() const;
-
-  Tensor Ensure(TensorDesc desc);
+  bool Supports(Device device) const override;
+  Tensor Allocate(TensorDesc desc) override;
+  void Clear();
 
  private:
-  TensorAllocator allocator_;
-  Tensor tensor_;
+  struct State;
+
+  std::unique_ptr<TensorAllocator> upstream_;
+  std::unique_ptr<State> state_;
 };
 
 }  // namespace mw::infer

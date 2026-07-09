@@ -13,7 +13,8 @@ namespace mw::infer {
 namespace process_internal {
 Tensor RunReorderChannelsOnDevice(const Tensor& input,
                                   const std::vector<int64_t>& order,
-                                  TensorLayout layout);
+                                  TensorLayout layout,
+                                  TensorAllocator& allocator);
 }  // namespace process_internal
 #endif
 
@@ -87,8 +88,9 @@ TensorDesc MakeOutputDesc(const Tensor& input) {
 
 Tensor RunReorderChannelsOnHost(const Tensor& input,
                                 const std::vector<int64_t>& order,
-                                ImageTensorShape shape, TensorLayout layout) {
-  Tensor output = Tensor::Allocate(MakeOutputDesc(input));
+                                ImageTensorShape shape, TensorLayout layout,
+                                TensorAllocator& allocator) {
+  Tensor output = Tensor::Allocate(MakeOutputDesc(input), allocator);
   const auto* input_data = static_cast<const float*>(input.data());
   auto* output_data = static_cast<float*>(output.data());
 
@@ -123,15 +125,16 @@ Tensor RunReorderChannelsOnHost(const Tensor& input,
 }  // namespace
 
 Tensor ReorderChannels(const Tensor& input, const std::vector<int64_t>& order,
-                       TensorLayout layout) {
+                       TensorLayout layout, TensorAllocator& allocator) {
   const ImageTensorShape shape = ValidateImageTensor(input, layout);
   ValidateOrder(order, shape.channels);
   if (input.device().type == DeviceType::kCpu) {
-    return RunReorderChannelsOnHost(input, order, shape, layout);
+    return RunReorderChannelsOnHost(input, order, shape, layout, allocator);
   }
   if (input.device().type == DeviceType::kCuda) {
 #if defined(MW_INFER_HAS_CUDA_PREPROCESS)
-    return process_internal::RunReorderChannelsOnDevice(input, order, layout);
+    return process_internal::RunReorderChannelsOnDevice(input, order, layout,
+                                                        allocator);
 #else
     throw std::runtime_error("CUDA preprocess is unavailable in this build");
 #endif

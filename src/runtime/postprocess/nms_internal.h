@@ -16,7 +16,7 @@ struct NmsParameters {
 #if defined(MW_INFER_HAS_CUDA_POSTPROCESS)
 
 Tensor RunNmsOnDevice(const Tensor& boxes, const Tensor& scores,
-                      NmsParameters parameters);
+                      NmsParameters parameters, TensorAllocator& allocator);
 
 #endif
 

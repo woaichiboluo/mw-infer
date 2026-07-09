@@ -33,11 +33,10 @@ std::string MakeOutputName(const Tensor& data) {
 }
 
 std::size_t RowBytes(const Tensor& data) {
-  std::size_t row_elements = 1;
-  for (std::size_t index = 1; index < data.shape().size(); ++index) {
-    row_elements *= static_cast<std::size_t>(data.shape()[index]);
-  }
-  return row_elements * DataTypeSize(data.data_type());
+  TensorDesc desc;
+  desc.info.data_type = data.data_type();
+  desc.info.shape.assign(data.shape().begin() + 1, data.shape().end());
+  return TensorBytes(desc);
 }
 
 TensorDesc MakeOutputDesc(const Tensor& data, int64_t selected_count) {
@@ -51,6 +50,9 @@ TensorDesc MakeOutputDesc(const Tensor& data, int64_t selected_count) {
 }
 
 int CheckedCount(int64_t value, const char* name) {
+  if (value < 0) {
+    throw std::invalid_argument(std::string(name) + " is negative");
+  }
   if (value > std::numeric_limits<int>::max()) {
     throw std::invalid_argument(std::string(name) + " exceeds int range");
   }
@@ -85,14 +87,19 @@ __global__ void GatherRowsKernel(const std::uint8_t* input,
 
 }  // namespace
 
-Tensor RunGatherRowsOnDevice(const Tensor& data, const Tensor& indices) {
+Tensor RunGatherRowsOnDevice(const Tensor& data, const Tensor& indices,
+                             TensorAllocator& allocator) {
   const int row_count = CheckedCount(data.shape()[0], "GatherRows row count");
   const int selected_count =
       CheckedCount(indices.shape()[0], "GatherRows selected count");
   const std::size_t row_bytes = RowBytes(data);
 
   CheckCuda(cudaSetDevice(data.device().id), "cudaSetDevice");
-  Tensor output = Tensor::Allocate(MakeOutputDesc(data, indices.shape()[0]));
+  Tensor output =
+      Tensor::Allocate(MakeOutputDesc(data, indices.shape()[0]), allocator);
+  if (selected_count == 0) {
+    return output;
+  }
 
   int* device_error = nullptr;
   CheckCuda(cudaMalloc(&device_error, sizeof(int)), "cudaMalloc");

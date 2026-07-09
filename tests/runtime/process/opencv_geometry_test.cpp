@@ -21,6 +21,12 @@ TEST(OpenCvGeometryTest, ResizesRawImageBatchAndRestoresPoint) {
   GeometryTransformer transformer;
   RawImageBatch raw_images(std::vector<cv::Mat>{cv::Mat(10, 20, CV_8UC3)});
 
+  GeometryResult original(raw_images);
+  EXPECT_EQ(original.original_size(0).width, 20);
+  EXPECT_EQ(original.original_size(0).height, 10);
+  EXPECT_EQ(original.transformed_size(0).width, 20);
+  EXPECT_EQ(original.transformed_size(0).height, 10);
+
   GeometryResult resized = transformer.Resize(raw_images, ImageSize{40, 20},
                                               Interpolation::kNearest);
 
@@ -29,6 +35,10 @@ TEST(OpenCvGeometryTest, ResizesRawImageBatchAndRestoresPoint) {
   EXPECT_EQ(output.cols, 40);
   EXPECT_EQ(output.rows, 20);
   EXPECT_EQ(output.type(), CV_8UC3);
+  EXPECT_EQ(resized.original_size(0).width, 20);
+  EXPECT_EQ(resized.original_size(0).height, 10);
+  EXPECT_EQ(resized.transformed_size(0).width, 40);
+  EXPECT_EQ(resized.transformed_size(0).height, 20);
 
   const GeometryTrace& trace = resized.trace(0);
   ASSERT_EQ(trace.size(), 1U);
@@ -39,6 +49,52 @@ TEST(OpenCvGeometryTest, ResizesRawImageBatchAndRestoresPoint) {
   const Point2f restored = trace.RestorePoint(Point2f{20.0F, 10.0F});
   EXPECT_FLOAT_EQ(restored.x, 10.0F);
   EXPECT_FLOAT_EQ(restored.y, 5.0F);
+}
+
+TEST(OpenCvGeometryTest, ComputesResizeShortSideSize) {
+  ImageSize wide = ResizeShortSideSize(ImageSize{20, 10}, 5);
+  EXPECT_EQ(wide.width, 10);
+  EXPECT_EQ(wide.height, 5);
+
+  ImageSize tall = ResizeShortSideSize(ImageSize{10, 20}, 5);
+  EXPECT_EQ(tall.width, 5);
+  EXPECT_EQ(tall.height, 10);
+
+  ImageSize square = ResizeShortSideSize(ImageSize{10, 10}, 7);
+  EXPECT_EQ(square.width, 7);
+  EXPECT_EQ(square.height, 7);
+}
+
+TEST(OpenCvGeometryTest, RejectsInvalidResizeShortSideSize) {
+  EXPECT_THROW(static_cast<void>(ResizeShortSideSize(ImageSize{0, 10}, 5)),
+               std::invalid_argument);
+  EXPECT_THROW(static_cast<void>(ResizeShortSideSize(ImageSize{10, 10}, 0)),
+               std::invalid_argument);
+}
+
+TEST(OpenCvGeometryTest, ResizesShortSideAndRecordsResizeStep) {
+  GeometryTransformer transformer;
+  RawImageBatch raw_images(std::vector<cv::Mat>{cv::Mat(10, 20, CV_8UC3)});
+
+  GeometryResult resized =
+      transformer.ResizeShortSide(raw_images, 5, Interpolation::kNearest);
+
+  const cv::Mat& output = GetOpenCvMat(resized.images().image(0));
+  EXPECT_EQ(output.cols, 10);
+  EXPECT_EQ(output.rows, 5);
+  EXPECT_EQ(resized.original_size(0).width, 20);
+  EXPECT_EQ(resized.original_size(0).height, 10);
+  EXPECT_EQ(resized.transformed_size(0).width, 10);
+  EXPECT_EQ(resized.transformed_size(0).height, 5);
+
+  const GeometryTrace& trace = resized.trace(0);
+  ASSERT_EQ(trace.size(), 1U);
+  const GeometryStep& step = trace.step(0);
+  EXPECT_EQ(step.kind, GeometryStepKind::kResize);
+  EXPECT_EQ(step.before_size.width, 20);
+  EXPECT_EQ(step.before_size.height, 10);
+  EXPECT_EQ(step.after_size.width, 10);
+  EXPECT_EQ(step.after_size.height, 5);
 }
 
 TEST(OpenCvGeometryTest, LetterBoxesImageAndRecordsSingleStep) {
@@ -82,6 +138,10 @@ TEST(OpenCvGeometryTest, CropsThenPadsGeometryResult) {
   EXPECT_EQ(output.cols, 12);
   EXPECT_EQ(output.rows, 10);
   EXPECT_EQ(output.at<cv::Vec3b>(0, 0), cv::Vec3b(9, 9, 9));
+  EXPECT_EQ(batch.original_size(0).width, 20);
+  EXPECT_EQ(batch.original_size(0).height, 10);
+  EXPECT_EQ(batch.transformed_size(0).width, 12);
+  EXPECT_EQ(batch.transformed_size(0).height, 10);
 
   const GeometryTrace& trace = batch.trace(0);
   ASSERT_EQ(trace.size(), 2U);

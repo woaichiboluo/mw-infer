@@ -25,7 +25,9 @@ Tensor MakeCpuFloatTensor(std::vector<int64_t> shape,
   desc.info.shape = std::move(shape);
   desc.device = Device{DeviceType::kCpu, 0};
   Tensor tensor = Tensor::Allocate(std::move(desc));
-  std::memcpy(tensor.data(), data.data(), tensor.bytes());
+  if (tensor.bytes() > 0) {
+    std::memcpy(tensor.data(), data.data(), tensor.bytes());
+  }
   return tensor;
 }
 
@@ -38,7 +40,9 @@ Tensor MakeCpuInt64Tensor(std::vector<int64_t> shape,
   desc.info.shape = std::move(shape);
   desc.device = Device{DeviceType::kCpu, 0};
   Tensor tensor = Tensor::Allocate(std::move(desc));
-  std::memcpy(tensor.data(), data.data(), tensor.bytes());
+  if (tensor.bytes() > 0) {
+    std::memcpy(tensor.data(), data.data(), tensor.bytes());
+  }
   return tensor;
 }
 
@@ -105,6 +109,20 @@ TEST(GatherRowsTest, PreservesInputDataType) {
   EXPECT_EQ(CopyCpuInt64(selected), std::vector<int64_t>({5, 6, 1, 2}));
 }
 
+TEST(GatherRowsTest, AllowsEmptyIndexTensor) {
+  Tensor values = MakeCpuFloatTensor(
+      {3, 2}, {1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F}, "values");
+  Tensor indices = MakeCpuInt64Tensor({0}, {}, "indices");
+
+  Tensor selected = GatherRows(values, indices);
+
+  EXPECT_FALSE(selected.empty());
+  EXPECT_EQ(selected.shape(), std::vector<int64_t>({0, 2}));
+  EXPECT_EQ(selected.element_count(), 0U);
+  EXPECT_EQ(selected.bytes(), 0U);
+  EXPECT_EQ(CopyCpuFloats(selected), std::vector<float>({}));
+}
+
 TEST(GatherRowsTest, RejectsInvalidInputs) {
   Tensor data = MakeCpuFloatTensor({3}, {1.0F, 2.0F, 3.0F}, "data");
   Tensor indices = MakeCpuInt64Tensor({2}, {0, 2}, "indices");
@@ -140,9 +158,11 @@ Tensor MakeCudaFloatTensor(std::vector<int64_t> shape,
   desc.info.shape = std::move(shape);
   desc.device = Device{DeviceType::kCuda, 0};
   Tensor tensor = Tensor::Allocate(std::move(desc));
-  EXPECT_EQ(cudaMemcpy(tensor.data(), data.data(), tensor.bytes(),
-                       cudaMemcpyHostToDevice),
-            cudaSuccess);
+  if (tensor.bytes() > 0) {
+    EXPECT_EQ(cudaMemcpy(tensor.data(), data.data(), tensor.bytes(),
+                         cudaMemcpyHostToDevice),
+              cudaSuccess);
+  }
   return tensor;
 }
 
@@ -155,9 +175,11 @@ Tensor MakeCudaInt64Tensor(std::vector<int64_t> shape,
   desc.info.shape = std::move(shape);
   desc.device = Device{DeviceType::kCuda, 0};
   Tensor tensor = Tensor::Allocate(std::move(desc));
-  EXPECT_EQ(cudaMemcpy(tensor.data(), data.data(), tensor.bytes(),
-                       cudaMemcpyHostToDevice),
-            cudaSuccess);
+  if (tensor.bytes() > 0) {
+    EXPECT_EQ(cudaMemcpy(tensor.data(), data.data(), tensor.bytes(),
+                         cudaMemcpyHostToDevice),
+              cudaSuccess);
+  }
   return tensor;
 }
 
@@ -165,9 +187,11 @@ std::vector<float> CopyCudaFloats(const Tensor& tensor) {
   EXPECT_EQ(tensor.device().type, DeviceType::kCuda);
   EXPECT_EQ(tensor.data_type(), DataType::kFloat32);
   std::vector<float> values(tensor.element_count());
-  EXPECT_EQ(cudaMemcpy(values.data(), tensor.data(), tensor.bytes(),
-                       cudaMemcpyDeviceToHost),
-            cudaSuccess);
+  if (tensor.bytes() > 0) {
+    EXPECT_EQ(cudaMemcpy(values.data(), tensor.data(), tensor.bytes(),
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+  }
   return values;
 }
 

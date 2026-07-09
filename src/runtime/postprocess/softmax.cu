@@ -105,11 +105,11 @@ __global__ void SoftmaxKernel(const float* logits, float* output, int rows,
 
 }  // namespace
 
-Tensor RunSoftmaxOnDevice(const Tensor& logits) {
+Tensor RunSoftmaxOnDevice(const Tensor& logits, TensorAllocator& allocator) {
   const MatrixShape shape = CheckedMatrixShape(logits);
   CheckCuda(cudaSetDevice(logits.device().id), "cudaSetDevice");
 
-  Tensor output = Tensor::Allocate(MakeOutputDesc(logits));
+  Tensor output = Tensor::Allocate(MakeOutputDesc(logits), allocator);
   SoftmaxKernel<<<shape.rows, kThreadsPerBlock>>>(
       static_cast<const float*>(logits.data()),
       static_cast<float*>(output.data()), shape.rows, shape.columns);
