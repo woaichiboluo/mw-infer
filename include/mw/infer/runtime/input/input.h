@@ -52,6 +52,7 @@ struct ImageDesc {
   int channels = 0;
   ImageMemoryKind memory_kind = ImageMemoryKind::kHost;
   std::vector<ImagePlaneDesc> planes;
+  int device_id = 0;
 };
 
 class RawImage {
@@ -78,6 +79,12 @@ class RawImage {
   DataType data_type() const { return desc_.data_type; }
   int channels() const { return desc_.channels; }
   ImageMemoryKind memory_kind() const { return desc_.memory_kind; }
+  Device device() const {
+    if (desc_.memory_kind == ImageMemoryKind::kCuda) {
+      return Device{DeviceType::kCuda, desc_.device_id};
+    }
+    return Device{DeviceType::kCpu, 0};
+  }
   ImageHandleKind handle_kind() const { return handle_kind_; }
   const void* handle() const { return handle_.get(); }
 
@@ -126,6 +133,7 @@ class RawImageBatch {
     const PixelFormat pixel_format = images_.front().pixel_format();
     const DataType data_type = images_.front().data_type();
     const int channels = images_.front().channels();
+    const Device device = images_.front().device();
     for (const RawImage& image : images_) {
       if (image.empty()) {
         throw std::invalid_argument("RawImageBatch contains an empty image");
@@ -144,6 +152,10 @@ class RawImageBatch {
       if (image.channels() != channels) {
         throw std::invalid_argument(
             "RawImageBatch cannot mix image channel counts");
+      }
+      if (image.device().type != device.type ||
+          image.device().id != device.id) {
+        throw std::invalid_argument("RawImageBatch cannot mix image devices");
       }
     }
   }

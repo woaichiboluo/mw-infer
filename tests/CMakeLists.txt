@@ -32,9 +32,28 @@ function(mw_infer_copy_onnxruntime_dlls target)
     if(_MW_INFER_ONNXRUNTIME_DLLS)
       add_custom_command(
         TARGET ${target}
-        POST_BUILD
+        PRE_LINK
+        COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:${target}>
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 ${_MW_INFER_ONNXRUNTIME_DLLS} $<TARGET_FILE_DIR:${target}>)
+    endif()
+  endif()
+endfunction()
+
+function(mw_infer_copy_tensorrt_dlls target)
+  if(WIN32 AND TENSORRT_NVINFER_LIBRARY)
+    get_filename_component(_MW_INFER_TENSORRT_LIB_DIR
+                           "${TENSORRT_NVINFER_LIBRARY}" DIRECTORY)
+    file(GLOB _MW_INFER_TENSORRT_DLLS
+         "${_MW_INFER_TENSORRT_LIB_DIR}/nvinfer*.dll"
+         "${_MW_INFER_TENSORRT_LIB_DIR}/nvonnxparser*.dll")
+    if(_MW_INFER_TENSORRT_DLLS)
+      add_custom_command(
+        TARGET ${target}
+        PRE_LINK
+        COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:${target}>
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${_MW_INFER_TENSORRT_DLLS} $<TARGET_FILE_DIR:${target}>)
     endif()
   endif()
 endfunction()
@@ -102,6 +121,13 @@ if(MW_INFER_FEATURE_ONNXRUNTIME_BACKEND_STATUS STREQUAL "enabled")
                        runtime_backend)
     mw_infer_copy_onnxruntime_dlls(mw_infer_onnx_dynamic_image_pipeline_test)
   endif()
+endif()
+
+if(MW_INFER_FEATURE_TENSORRT_BACKEND_STATUS STREQUAL "enabled")
+  mw_infer_add_gtest(mw_infer_tensorrt_backend_test
+                     runtime/backend/tensorrt_backend_test.cpp
+                     runtime_backend)
+  mw_infer_copy_tensorrt_dlls(mw_infer_tensorrt_backend_test)
 endif()
 
 if(MW_INFER_FEATURE_CUDA_TENSOR_STATUS STREQUAL "enabled")

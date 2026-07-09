@@ -24,6 +24,7 @@ TEST(OpenCvCudaGeometryTest, ResizesGpuMatBatchAndRestoresPoint) {
     GTEST_SKIP() << "OpenCV CUDA device is unavailable";
   }
 
+  const int device_id = cv::cuda::getDevice();
   GeometryTransformer transformer;
   RawImageBatch raw_images(
       std::vector<cv::cuda::GpuMat>{cv::cuda::GpuMat(10, 20, CV_8UC3)});
@@ -32,6 +33,8 @@ TEST(OpenCvCudaGeometryTest, ResizesGpuMatBatchAndRestoresPoint) {
                                               Interpolation::kNearest);
 
   ASSERT_EQ(resized.size(), 1U);
+  EXPECT_EQ(resized.images().image(0).device().type, DeviceType::kCuda);
+  EXPECT_EQ(resized.images().image(0).device().id, device_id);
   const cv::cuda::GpuMat& output =
       GetOpenCvCudaGpuMat(resized.images().image(0));
   EXPECT_EQ(output.cols, 40);

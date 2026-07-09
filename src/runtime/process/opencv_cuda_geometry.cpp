@@ -45,6 +45,14 @@ cv::Scalar ToOpenCvScalar(const FillValue& value) {
   return scalar;
 }
 
+void SetImageDevice(const RawImage& image) {
+  const Device device = image.device();
+  if (device.type != DeviceType::kCuda) {
+    throw std::invalid_argument("OpenCV CUDA image must be on a CUDA device");
+  }
+  cv::cuda::setDevice(device.id);
+}
+
 cv::cuda::GpuMat ResizeGpuMat(const cv::cuda::GpuMat& source, ImageSize size,
                               Interpolation interpolation) {
   const int channels = source.channels();
@@ -109,22 +117,27 @@ cv::cuda::GpuMat CopyMakeBorderGpuMat(const cv::cuda::GpuMat& source,
 class OpenCvCudaGeometryAdapter final : public GeometryAdapter {
  public:
   bool Supports(const RawImage& image) const override {
-    return image.handle_kind() == ImageHandleKind::kOpenCvCudaGpuMat;
+    const Device device = image.device();
+    return image.handle_kind() == ImageHandleKind::kOpenCvCudaGpuMat &&
+           device.type == DeviceType::kCuda && device.id >= 0;
   }
 
   RawImage Resize(const RawImage& image, ImageSize size,
                   Interpolation interpolation) const override {
+    SetImageDevice(image);
     return ToRawImage(
         ResizeGpuMat(GetOpenCvCudaGpuMat(image), size, interpolation));
   }
 
   RawImage Pad(const RawImage& image, Padding padding,
                const FillValue& value) const override {
+    SetImageDevice(image);
     return ToRawImage(
         CopyMakeBorderGpuMat(GetOpenCvCudaGpuMat(image), padding, value));
   }
 
   RawImage Crop(const RawImage& image, Rect rect) const override {
+    SetImageDevice(image);
     const cv::cuda::GpuMat& source = GetOpenCvCudaGpuMat(image);
     return ToRawImage(source(ToOpenCvRect(rect)).clone());
   }

@@ -18,16 +18,31 @@ bool HasUsableCudaDevice() {
   }
 }
 
+RawImage MakeCudaRawImageWithDevice(int device_id) {
+  ImageDesc desc;
+  desc.size = ImageSize{20, 10};
+  desc.pixel_format = PixelFormat::kBgr;
+  desc.data_type = DataType::kUInt8;
+  desc.channels = 3;
+  desc.memory_kind = ImageMemoryKind::kCuda;
+  desc.device_id = device_id;
+  return RawImage::FromHandle(desc, ImageHandleKind::kOpenCvCudaGpuMat,
+                              cv::cuda::GpuMat());
+}
+
 TEST(OpenCvCudaInputTest, WrapsGpuMatAsRawImage) {
   if (!HasUsableCudaDevice()) {
     GTEST_SKIP() << "OpenCV CUDA device is unavailable";
   }
 
+  const int device_id = cv::cuda::getDevice();
   cv::cuda::GpuMat mat(10, 20, CV_8UC3);
 
   RawImage image = ToRawImage(mat);
 
   EXPECT_EQ(image.memory_kind(), ImageMemoryKind::kCuda);
+  EXPECT_EQ(image.device().type, DeviceType::kCuda);
+  EXPECT_EQ(image.device().id, device_id);
   EXPECT_EQ(image.handle_kind(), ImageHandleKind::kOpenCvCudaGpuMat);
   EXPECT_EQ(image.pixel_format(), PixelFormat::kBgr);
   EXPECT_EQ(image.data_type(), DataType::kUInt8);
@@ -134,6 +149,7 @@ TEST(OpenCvCudaInputTest, WrapsGpuMatBatch) {
 
   ASSERT_EQ(batch.size(), 2U);
   EXPECT_EQ(batch.memory_kind(), ImageMemoryKind::kCuda);
+  EXPECT_EQ(batch.image(0).device().type, DeviceType::kCuda);
   EXPECT_EQ(batch.image(0).pixel_format(), PixelFormat::kBgr);
   EXPECT_EQ(batch.image(0).channels(), 3);
 
@@ -154,6 +170,13 @@ TEST(OpenCvCudaInputTest, ConstructsRawImageBatchFromGpuMatVector) {
   ASSERT_EQ(batch.size(), 2U);
   EXPECT_EQ(batch.memory_kind(), ImageMemoryKind::kCuda);
   EXPECT_EQ(batch.image(1).size().width, 21);
+}
+
+TEST(OpenCvCudaInputTest, RejectsMixedCudaDevices) {
+  EXPECT_THROW(
+      static_cast<void>(RawImageBatch(std::vector<RawImage>{
+          MakeCudaRawImageWithDevice(0), MakeCudaRawImageWithDevice(1)})),
+      std::invalid_argument);
 }
 
 TEST(OpenCvCudaInputTest, RejectsEmptyGpuMat) {

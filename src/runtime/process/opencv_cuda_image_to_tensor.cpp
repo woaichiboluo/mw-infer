@@ -110,8 +110,21 @@ bool NeedsRgbChannelOrder(PixelFormat pixel_format) {
          pixel_format == PixelFormat::kBgra;
 }
 
-cv::cuda::GpuMat ToGpuMat(const RawImage& image) {
+bool IsSourceDeviceSupported(const RawImage& image, Device target_device) {
+  if (image.handle_kind() != ImageHandleKind::kOpenCvCudaGpuMat) {
+    return true;
+  }
+  const Device source_device = image.device();
+  return source_device.type == DeviceType::kCuda &&
+         source_device.id == target_device.id;
+}
+
+cv::cuda::GpuMat ToGpuMat(const RawImage& image, Device target_device) {
   if (image.handle_kind() == ImageHandleKind::kOpenCvCudaGpuMat) {
+    if (!IsSourceDeviceSupported(image, target_device)) {
+      throw std::invalid_argument(
+          "OpenCV CUDA image device id must match output tensor device id");
+    }
     return GetOpenCvCudaGpuMat(image);
   }
   if (image.handle_kind() == ImageHandleKind::kOpenCvMat) {
@@ -200,7 +213,8 @@ class OpenCvCudaImageToTensorAdapter final : public ImageToTensorAdapter {
     for (const RawImage& image : images.images()) {
       if ((image.handle_kind() != ImageHandleKind::kOpenCvCudaGpuMat &&
            image.handle_kind() != ImageHandleKind::kOpenCvMat) ||
-          !IsSupportedSourceDataType(image.data_type())) {
+          !IsSupportedSourceDataType(image.data_type()) ||
+          !IsSourceDeviceSupported(image, target_device)) {
         return false;
       }
     }
@@ -222,7 +236,7 @@ class OpenCvCudaImageToTensorAdapter final : public ImageToTensorAdapter {
     for (std::size_t batch_index = 0; batch_index < batch.size();
          ++batch_index) {
       const RawImage& raw_image = batch[batch_index];
-      cv::cuda::GpuMat image = ToGpuMat(raw_image);
+      cv::cuda::GpuMat image = ToGpuMat(raw_image, output->device());
       switch (layout) {
         case TensorLayout::kBchw:
           CopyToBchw(image, raw_image.pixel_format(), output, batch_index);

@@ -311,6 +311,18 @@ TEST(TensorTest, PooledTensorAllocatorGrowsWhenReleasedBlockIsTooSmall) {
   EXPECT_EQ(larger.capacity_bytes(), 384U);
 }
 
+TEST(TensorTest, PooledTensorCanOutliveAllocator) {
+  Tensor tensor;
+  {
+    PooledTensorAllocator allocator;
+    tensor = Tensor::Allocate(MakeDesc(), allocator);
+    ASSERT_FALSE(tensor.empty());
+    EXPECT_NE(tensor.data(), nullptr);
+  }
+
+  tensor = Tensor();
+}
+
 TEST(TensorTest, DirectTensorAllocatorRejectsUnsupportedDevice) {
   DirectTensorAllocator allocator(MakeCpuOnlyTestAdapters());
   TensorDesc desc = MakeDesc();

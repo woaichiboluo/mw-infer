@@ -23,6 +23,7 @@ struct YoloDecodeResult {
   Tensor nms_boxes;
   Tensor scores;
   Tensor class_ids;
+  Tensor batch_ids;
 };
 
 YoloDecodeResult YoloDecode(

@@ -15,12 +15,19 @@ std::unique_ptr<BackendAdapter> CreateOnnxCpuBackendAdapter();
 std::unique_ptr<BackendAdapter> CreateOnnxGpuBackendAdapter();
 #endif
 
+#if defined(MW_INFER_HAS_TENSORRT_BACKEND)
+std::unique_ptr<BackendAdapter> CreateTensorRtBackendAdapter();
+#endif
+
 BackendFactory::BackendFactory() {
 #if defined(MW_INFER_HAS_ONNXRUNTIME_BACKEND)
   AddAdapter(CreateOnnxCpuBackendAdapter());
 #endif
 #if defined(MW_INFER_HAS_ONNXRUNTIME_CUDA_PROVIDER)
   AddAdapter(CreateOnnxGpuBackendAdapter());
+#endif
+#if defined(MW_INFER_HAS_TENSORRT_BACKEND)
+  AddAdapter(CreateTensorRtBackendAdapter());
 #endif
 }
 

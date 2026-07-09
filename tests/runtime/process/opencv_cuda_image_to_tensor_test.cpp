@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -38,6 +39,18 @@ cv::Mat MakeFourChannelTestMat() {
   image.at<cv::Vec4b>(0, 0) = cv::Vec4b(1, 2, 3, 4);
   image.at<cv::Vec4b>(0, 1) = cv::Vec4b(5, 6, 7, 8);
   return image;
+}
+
+RawImage MakeCudaRawImageWithDevice(int device_id) {
+  ImageDesc desc;
+  desc.size = ImageSize{2, 1};
+  desc.pixel_format = PixelFormat::kBgr;
+  desc.data_type = DataType::kUInt8;
+  desc.channels = 3;
+  desc.memory_kind = ImageMemoryKind::kCuda;
+  desc.device_id = device_id;
+  return RawImage::FromHandle(desc, ImageHandleKind::kOpenCvCudaGpuMat,
+                              cv::cuda::GpuMat());
 }
 
 std::vector<float> CopyFloatTensorToHost(const Tensor& tensor) {
@@ -124,6 +137,17 @@ TEST(OpenCvCudaImageToTensorTest, ConvertsBgraGpuMatToRgbaTensor) {
   EXPECT_FLOAT_EQ(values[5], 6.0F);
   EXPECT_FLOAT_EQ(values[6], 5.0F);
   EXPECT_FLOAT_EQ(values[7], 8.0F);
+}
+
+TEST(OpenCvCudaImageToTensorTest, RejectsGpuMatOnDifferentDevice) {
+  RawImageBatch images(std::vector<RawImage>{MakeCudaRawImageWithDevice(1)});
+  ImageToTensorConverter converter;
+
+  EXPECT_FALSE(converter.Supports(images, Device{DeviceType::kCuda, 0},
+                                  MakeInput({1, 3, 1, 2})));
+  EXPECT_THROW(static_cast<void>(ToTensor(images, Device{DeviceType::kCuda, 0},
+                                          MakeInput({1, 3, 1, 2}))),
+               std::invalid_argument);
 }
 
 }  // namespace

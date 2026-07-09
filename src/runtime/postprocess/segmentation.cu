@@ -238,6 +238,12 @@ __global__ void SemanticSegmentationKernel(const float* logits,
 
   if (class_count == 1) {
     const float value = logits[output_index];
+    if (value == -FLT_MAX) {
+      class_ids[output_index] = 0;
+      scores[output_index] = 0.0F;
+      return;
+    }
+
     const float probability = 1.0F / (1.0F + expf(-value));
     const bool foreground = probability >= binary_threshold;
     class_ids[output_index] = foreground ? 1 : 0;
@@ -256,7 +262,16 @@ __global__ void SemanticSegmentationKernel(const float* logits,
   }
 
   class_ids[output_index] = best_class;
-  scores[output_index] = best_score;
+  if (best_score == -FLT_MAX) {
+    scores[output_index] = 0.0F;
+    return;
+  }
+
+  float sum = 0.0F;
+  for (int class_id = 0; class_id < class_count; ++class_id) {
+    sum += expf(logits[base + class_id * image_pixels] - best_score);
+  }
+  scores[output_index] = 1.0F / sum;
 }
 
 __device__ void ForwardResize(int before_width, int before_height,

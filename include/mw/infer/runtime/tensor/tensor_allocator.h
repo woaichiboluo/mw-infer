@@ -50,7 +50,7 @@ class PooledTensorAllocator final : public TensorAllocator {
   struct State;
 
   std::unique_ptr<TensorAllocator> upstream_;
-  std::unique_ptr<State> state_;
+  std::shared_ptr<State> state_;
 };
 
 }  // namespace mw::infer

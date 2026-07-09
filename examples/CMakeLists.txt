@@ -1,9 +1,20 @@
-add_executable(model_check onnx/model_check.cpp)
+add_executable(model_check model_check.cpp)
 target_link_libraries(model_check PRIVATE MwInfer::Runtime CLI11::CLI11)
 if(TARGET fmt::fmt-header-only)
   target_link_libraries(model_check PRIVATE fmt::fmt-header-only)
 else()
   target_link_libraries(model_check PRIVATE fmt::fmt)
+endif()
+
+if(MW_INFER_FEATURE_TENSORRT_BACKEND_STATUS STREQUAL "enabled")
+  add_executable(tensorrt_mnist_infer tensorrt/mnist_infer.cpp)
+  target_link_libraries(tensorrt_mnist_infer PRIVATE MwInfer::Runtime
+                                                     CLI11::CLI11)
+  if(TARGET fmt::fmt-header-only)
+    target_link_libraries(tensorrt_mnist_infer PRIVATE fmt::fmt-header-only)
+  else()
+    target_link_libraries(tensorrt_mnist_infer PRIVATE fmt::fmt)
+  endif()
 endif()
 
 find_package(OpenCV QUIET COMPONENTS imgcodecs)
@@ -43,6 +54,29 @@ if(TARGET opencv_imgcodecs)
     target_link_libraries(segmentation_fcn_infer PRIVATE fmt::fmt-header-only)
   else()
     target_link_libraries(segmentation_fcn_infer PRIVATE fmt::fmt)
+  endif()
+
+  if(MW_INFER_FEATURE_TENSORRT_BACKEND_STATUS STREQUAL "enabled")
+    add_executable(tensorrt_yolo_infer tensorrt/yolo_infer.cpp)
+    target_link_libraries(tensorrt_yolo_infer PRIVATE MwInfer::Runtime
+                                                      opencv_imgcodecs
+                                                      CLI11::CLI11)
+    if(TARGET fmt::fmt-header-only)
+      target_link_libraries(tensorrt_yolo_infer PRIVATE fmt::fmt-header-only)
+    else()
+      target_link_libraries(tensorrt_yolo_infer PRIVATE fmt::fmt)
+    endif()
+
+    add_executable(tensorrt_yolo_nms_infer tensorrt/yolo_nms_infer.cpp)
+    target_link_libraries(tensorrt_yolo_nms_infer PRIVATE MwInfer::Runtime
+                                                          opencv_imgcodecs
+                                                          CLI11::CLI11)
+    if(TARGET fmt::fmt-header-only)
+      target_link_libraries(tensorrt_yolo_nms_infer
+                            PRIVATE fmt::fmt-header-only)
+    else()
+      target_link_libraries(tensorrt_yolo_nms_infer PRIVATE fmt::fmt)
+    endif()
   endif()
 endif()
 
@@ -86,6 +120,46 @@ if(WIN32 AND ONNXRUNTIME_DIR)
         COMMAND
           ${CMAKE_COMMAND} -E copy_if_different ${_MW_INFER_ONNXRUNTIME_DLLS}
           $<TARGET_FILE_DIR:segmentation_fcn_infer>)
+    endif()
+  endif()
+endif()
+
+if(WIN32 AND MW_INFER_FEATURE_TENSORRT_BACKEND_STATUS STREQUAL "enabled"
+   AND TENSORRT_NVINFER_LIBRARY)
+  get_filename_component(_MW_INFER_TENSORRT_LIB_DIR
+                         "${TENSORRT_NVINFER_LIBRARY}" DIRECTORY)
+  file(GLOB _MW_INFER_TENSORRT_DLLS
+       "${_MW_INFER_TENSORRT_LIB_DIR}/nvinfer*.dll"
+       "${_MW_INFER_TENSORRT_LIB_DIR}/nvonnxparser*.dll")
+  if(_MW_INFER_TENSORRT_DLLS)
+    add_custom_command(
+      TARGET model_check
+      POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              ${_MW_INFER_TENSORRT_DLLS} $<TARGET_FILE_DIR:model_check>)
+    if(TARGET tensorrt_mnist_infer)
+      add_custom_command(
+        TARGET tensorrt_mnist_infer
+        POST_BUILD
+        COMMAND
+          ${CMAKE_COMMAND} -E copy_if_different ${_MW_INFER_TENSORRT_DLLS}
+          $<TARGET_FILE_DIR:tensorrt_mnist_infer>)
+    endif()
+    if(TARGET tensorrt_yolo_infer)
+      add_custom_command(
+        TARGET tensorrt_yolo_infer
+        POST_BUILD
+        COMMAND
+          ${CMAKE_COMMAND} -E copy_if_different ${_MW_INFER_TENSORRT_DLLS}
+          $<TARGET_FILE_DIR:tensorrt_yolo_infer>)
+    endif()
+    if(TARGET tensorrt_yolo_nms_infer)
+      add_custom_command(
+        TARGET tensorrt_yolo_nms_infer
+        POST_BUILD
+        COMMAND
+          ${CMAKE_COMMAND} -E copy_if_different ${_MW_INFER_TENSORRT_DLLS}
+          $<TARGET_FILE_DIR:tensorrt_yolo_nms_infer>)
     endif()
   endif()
 endif()

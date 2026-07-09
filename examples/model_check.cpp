@@ -39,6 +39,16 @@ std::string_view DataTypeName(mw::infer::DataType data_type) {
   return "unknown";
 }
 
+std::string_view ModelFormatName(mw::infer::ModelFormat format) {
+  switch (format) {
+    case mw::infer::ModelFormat::kOnnx:
+      return "onnx";
+    case mw::infer::ModelFormat::kTensorRT:
+      return "tensorrt";
+  }
+  return "unknown";
+}
+
 std::string ShapeString(const std::vector<int64_t>& shape) {
   return fmt::format("[{}]", fmt::join(shape, ", "));
 }
@@ -53,14 +63,32 @@ void PrintTensorInfos(const char* label,
   }
 }
 
+void PrintProfiles(const std::vector<mw::infer::ModelProfile>& profiles) {
+  fmt::print("profiles: {}\n", profiles.size());
+  for (std::size_t profile_index = 0; profile_index < profiles.size();
+       ++profile_index) {
+    const mw::infer::ModelProfile& profile = profiles[profile_index];
+    fmt::print("  [{}] name=\"{}\" input_ranges={}\n", profile_index,
+               profile.name, profile.inputs.size());
+    for (std::size_t input_index = 0; input_index < profile.inputs.size();
+         ++input_index) {
+      const mw::infer::TensorShapeRange& range = profile.inputs[input_index];
+      fmt::print("    [{}] name=\"{}\" min={} opt={} max={}\n", input_index,
+                 range.name, ShapeString(range.min_shape),
+                 ShapeString(range.opt_shape), ShapeString(range.max_shape));
+    }
+  }
+}
+
 struct CliArguments {
   std::string model_path;
   std::string device = "cpu";
 };
 
 void ConfigureCli(CLI::App* app, CliArguments* arguments) {
-  app->description("Inspect an ONNX model through the MwInfer backend.");
-  app->add_option("model", arguments->model_path, "ONNX model path")
+  app->description("Inspect model metadata through the MwInfer backend.");
+  app->add_option("model", arguments->model_path,
+                  "Model path (.onnx, .engine, or .plan)")
       ->required()
       ->check(CLI::ExistingFile);
   app->add_option("device", arguments->device,
@@ -91,10 +119,12 @@ int main(int argc, char** argv) {
     const mw::infer::ModelInfo& model_info = backend->model_info();
 
     fmt::print("model: {}\n", active_model.name);
+    fmt::print("format: {}\n", ModelFormatName(active_model.format));
     fmt::print("path: {}\n", model_path.string());
     fmt::print("backend_device: {}\n", backend->execution_device().ToString());
     PrintTensorInfos("inputs", model_info.inputs);
     PrintTensorInfos("outputs", model_info.outputs);
+    PrintProfiles(model_info.profiles);
   } catch (const std::exception& error) {
     fmt::print(stderr, "model_check failed: {}\n", error.what());
     return 1;

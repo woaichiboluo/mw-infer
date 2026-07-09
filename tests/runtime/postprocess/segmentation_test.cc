@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -71,6 +72,15 @@ void ExpectNearVector(const std::vector<float>& actual,
   }
 }
 
+float SelectedProbability(const std::vector<float>& logits) {
+  const float max_logit = *std::max_element(logits.begin(), logits.end());
+  float sum = 0.0F;
+  for (float logit : logits) {
+    sum += std::exp(logit - max_logit);
+  }
+  return 1.0F / sum;
+}
+
 void ExpectSegmentationResult(const SemanticSegmentationResult& result,
                               DeviceType device) {
   EXPECT_EQ(result.class_ids.device().type, device);
@@ -80,8 +90,13 @@ void ExpectSegmentationResult(const SemanticSegmentationResult& result,
   EXPECT_EQ(result.class_ids.shape(), std::vector<int64_t>({1, 2, 2}));
   EXPECT_EQ(result.scores.shape(), std::vector<int64_t>({1, 2, 2}));
   EXPECT_EQ(CopyInt64s(result.class_ids), std::vector<int64_t>({1, 0, 2, 1}));
-  EXPECT_EQ(CopyFloats(result.scores),
-            std::vector<float>({0.8F, 0.9F, 0.6F, 0.7F}));
+  ExpectNearVector(CopyFloats(result.scores),
+                   {
+                       SelectedProbability({0.1F, 0.8F, 0.2F}),
+                       SelectedProbability({0.9F, 0.2F, 0.1F}),
+                       SelectedProbability({0.3F, 0.4F, 0.6F}),
+                       SelectedProbability({0.2F, 0.7F, 0.1F}),
+                   });
 }
 
 std::vector<GeometryTrace> ResizeTraceBatch(ImageSize before_size,
@@ -97,6 +112,13 @@ std::vector<GeometryTrace> LetterBoxTraceBatch(ImageSize before_size,
                                                Padding padding) {
   GeometryTrace trace;
   trace.AddLetterBox(before_size, after_size, resized_size, padding);
+  return {trace};
+}
+
+std::vector<GeometryTrace> CropTraceBatch(ImageSize before_size,
+                                          Rect crop_rect) {
+  GeometryTrace trace;
+  trace.AddCrop(before_size, crop_rect);
   return {trace};
 }
 
@@ -126,8 +148,13 @@ TEST(SegmentationPostprocessTest, SupportsBatchDimension) {
 
   EXPECT_EQ(result.class_ids.shape(), std::vector<int64_t>({2, 1, 2}));
   EXPECT_EQ(CopyInt64s(result.class_ids), std::vector<int64_t>({1, 0, 0, 1}));
-  EXPECT_EQ(CopyFloats(result.scores),
-            std::vector<float>({0.9F, 0.8F, 0.7F, 0.6F}));
+  ExpectNearVector(CopyFloats(result.scores),
+                   {
+                       SelectedProbability({0.1F, 0.9F}),
+                       SelectedProbability({0.8F, 0.2F}),
+                       SelectedProbability({0.7F, 0.3F}),
+                       SelectedProbability({0.4F, 0.6F}),
+                   });
 }
 
 TEST(SegmentationPostprocessTest, RestoresResizeBeforeSelectingClass) {
@@ -149,7 +176,37 @@ TEST(SegmentationPostprocessTest, RestoresResizeBeforeSelectingClass) {
 
   EXPECT_EQ(result.class_ids.shape(), std::vector<int64_t>({1, 1, 2}));
   EXPECT_EQ(CopyInt64s(result.class_ids), std::vector<int64_t>({1, 0}));
-  EXPECT_EQ(CopyFloats(result.scores), std::vector<float>({10.0F, 10.0F}));
+  ExpectNearVector(CopyFloats(result.scores),
+                   {
+                       SelectedProbability({0.0F, 10.0F}),
+                       SelectedProbability({10.0F, 0.0F}),
+                   });
+}
+
+TEST(SegmentationPostprocessTest, RestoresLogitsToOriginalShape) {
+  Tensor logits = MakeCpuFloatTensor({1, 2, 1, 2},
+                                     {
+                                         0.0F,
+                                         10.0F,
+                                         10.0F,
+                                         0.0F,
+                                     },
+                                     "logits");
+
+  Tensor restored = RestoreSegmentationLogits(
+      logits, ResizeTraceBatch(ImageSize{4, 1}, ImageSize{2, 1}));
+
+  EXPECT_EQ(restored.shape(), std::vector<int64_t>({1, 2, 1, 4}));
+  ExpectNearVector(CopyFloats(restored), {
+                                             0.0F,
+                                             2.5F,
+                                             7.5F,
+                                             10.0F,
+                                             10.0F,
+                                             7.5F,
+                                             2.5F,
+                                             0.0F,
+                                         });
 }
 
 TEST(SegmentationPostprocessTest, RestoresLetterBoxBeforeSelectingClass) {
@@ -169,6 +226,30 @@ TEST(SegmentationPostprocessTest, RestoresLetterBoxBeforeSelectingClass) {
   EXPECT_EQ(result.class_ids.shape(), std::vector<int64_t>({1, 4, 2}));
   EXPECT_EQ(CopyInt64s(result.class_ids),
             std::vector<int64_t>({1, 0, 1, 0, 1, 0, 1, 0}));
+}
+
+TEST(SegmentationPostprocessTest, RestoredInvalidPixelsHaveZeroScore) {
+  Tensor logits = MakeCpuFloatTensor({1, 2, 1, 2},
+                                     {
+                                         0.0F,
+                                         10.0F,
+                                         10.0F,
+                                         0.0F,
+                                     },
+                                     "logits");
+
+  SemanticSegmentationResult result = SemanticSegmentation(
+      logits, CropTraceBatch(ImageSize{4, 1}, Rect{1, 0, 2, 1}));
+
+  EXPECT_EQ(result.class_ids.shape(), std::vector<int64_t>({1, 1, 4}));
+  EXPECT_EQ(CopyInt64s(result.class_ids), std::vector<int64_t>({0, 1, 0, 0}));
+  ExpectNearVector(CopyFloats(result.scores),
+                   {
+                       0.0F,
+                       SelectedProbability({0.0F, 10.0F}),
+                       SelectedProbability({10.0F, 0.0F}),
+                       0.0F,
+                   });
 }
 
 TEST(SegmentationPostprocessTest, SupportsSingleChannelBinaryLogits) {
@@ -207,6 +288,26 @@ TEST(SegmentationPostprocessTest, RejectsInvalidInputs) {
   EXPECT_THROW(static_cast<void>(RestoreSegmentationLogits(logits, {})),
                std::invalid_argument);
   EXPECT_NO_THROW(static_cast<void>(SemanticSegmentation(logits)));
+}
+
+TEST(SegmentationPostprocessTest,
+     RejectsRestoreBatchWithDifferentOriginalSizes) {
+  Tensor logits = MakeCpuFloatTensor({2, 2, 1, 1},
+                                     {
+                                         0.0F,
+                                         1.0F,
+                                         1.0F,
+                                         0.0F,
+                                     },
+                                     "logits");
+  GeometryTrace first;
+  first.AddResize(ImageSize{2, 1}, ImageSize{1, 1});
+  GeometryTrace second;
+  second.AddResize(ImageSize{3, 1}, ImageSize{1, 1});
+
+  EXPECT_THROW(static_cast<void>(RestoreSegmentationLogits(
+                   logits, std::vector<GeometryTrace>{first, second})),
+               std::invalid_argument);
 }
 
 #if defined(MW_INFER_HAS_CUDA_POSTPROCESS)
@@ -269,7 +370,11 @@ TEST(SegmentationPostprocessTest, RestoresCudaTensorBeforeSelectingClass) {
   EXPECT_EQ(result.class_ids.device().type, DeviceType::kCuda);
   EXPECT_EQ(result.class_ids.shape(), std::vector<int64_t>({1, 1, 2}));
   EXPECT_EQ(CopyInt64s(result.class_ids), std::vector<int64_t>({1, 0}));
-  EXPECT_EQ(CopyFloats(result.scores), std::vector<float>({10.0F, 10.0F}));
+  ExpectNearVector(CopyFloats(result.scores),
+                   {
+                       SelectedProbability({0.0F, 10.0F}),
+                       SelectedProbability({10.0F, 0.0F}),
+                   });
 }
 
 #endif

@@ -177,4 +177,28 @@ if(TARGET ONNXRuntime::ONNXRuntime)
   endif()
 endif()
 
+find_package(TensorRT QUIET)
+
+set(MW_INFER_DEPENDENCY_TENSORRT_STATUS "not found" PARENT_SCOPE)
+
+if(TensorRT_FOUND)
+  set(MW_INFER_DEPENDENCY_TENSORRT_STATUS
+      "found ${TensorRT_VERSION}" PARENT_SCOPE)
+  if(TARGET CUDA::cudart AND TensorRT_API_FAMILY EQUAL 10)
+    set(MW_INFER_FEATURE_TENSORRT_BACKEND_STATUS "enabled" PARENT_SCOPE)
+    target_sources(MwInferRuntime PRIVATE runtime/backend/tensorrt_backend.cpp)
+    target_compile_definitions(MwInferRuntime
+                               PRIVATE MW_INFER_HAS_TENSORRT_BACKEND=1)
+    target_link_libraries(MwInferRuntime PUBLIC TensorRT::nvinfer
+                                                TensorRT::nvinfer_plugin)
+  elseif(NOT TARGET CUDA::cudart)
+    set(MW_INFER_FEATURE_TENSORRT_BACKEND_STATUS
+        "disabled (CUDA runtime not found)" PARENT_SCOPE)
+  else()
+    set(MW_INFER_FEATURE_TENSORRT_BACKEND_STATUS
+        "disabled (TensorRT API family ${TensorRT_API_FAMILY} unsupported)"
+        PARENT_SCOPE)
+  endif()
+endif()
+
 install(TARGETS MwInferRuntime EXPORT MwInferTargets)

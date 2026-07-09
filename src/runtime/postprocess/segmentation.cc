@@ -273,6 +273,20 @@ float Sigmoid(float value) {
   return exp_value / (1.0F + exp_value);
 }
 
+bool IsRestoreInvalidScore(float value) {
+  return value == std::numeric_limits<float>::lowest();
+}
+
+float SelectedSoftmaxProbability(const float* input, int64_t base,
+                                 int64_t plane_size, int64_t classes,
+                                 float selected_logit) {
+  float sum = 0.0F;
+  for (int64_t class_id = 0; class_id < classes; ++class_id) {
+    sum += std::exp(input[base + class_id * plane_size] - selected_logit);
+  }
+  return 1.0F / sum;
+}
+
 Tensor RunRestoreSegmentationLogitsOnHost(
     const Tensor& logits, SegmentationShape shape,
     const std::vector<GeometryTrace>& traces, const RestorePlan& plan,
@@ -334,7 +348,14 @@ SemanticSegmentationResult RunSemanticSegmentationOnHost(
     for (int64_t pixel = 0; pixel < plane_size; ++pixel) {
       const int64_t output_index = batch * plane_size + pixel;
       if (shape.classes == 1) {
-        const float probability = Sigmoid(input[output_index]);
+        const float value = input[output_index];
+        if (IsRestoreInvalidScore(value)) {
+          output_ids[output_index] = 0;
+          output_scores[output_index] = 0.0F;
+          continue;
+        }
+
+        const float probability = Sigmoid(value);
         const bool foreground = probability >= options.binary_threshold;
         output_ids[output_index] = foreground ? 1 : 0;
         output_scores[output_index] =
@@ -354,7 +375,11 @@ SemanticSegmentationResult RunSemanticSegmentationOnHost(
       }
 
       output_ids[output_index] = best_class;
-      output_scores[output_index] = best_score;
+      output_scores[output_index] =
+          IsRestoreInvalidScore(best_score)
+              ? 0.0F
+              : SelectedSoftmaxProbability(input, base, plane_size,
+                                           shape.classes, best_score);
     }
   }
 

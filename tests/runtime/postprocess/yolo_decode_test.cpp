@@ -46,6 +46,24 @@ std::vector<float> YoloV5CandidateFirstPredictions() {
   };
 }
 
+std::vector<float> YoloV8TwoBatchChannelFirstPredictions() {
+  return {
+      5.0F,  6.0F,   //
+      5.0F,  6.0F,   //
+      10.0F, 10.0F,  //
+      10.0F, 10.0F,  //
+      0.9F,  0.8F,   //
+      0.1F,  0.2F,   //
+
+      5.0F,  6.0F,   //
+      5.0F,  6.0F,   //
+      10.0F, 10.0F,  //
+      10.0F, 10.0F,  //
+      0.85F, 0.7F,   //
+      0.1F,  0.2F,
+  };
+}
+
 Tensor MakeCpuFloatTensor(std::vector<int64_t> shape,
                           const std::vector<float>& data,
                           std::string name = {}) {
@@ -83,14 +101,17 @@ void ExpectYoloV8DecodedResult(const YoloDecodeResult& result,
   EXPECT_EQ(result.nms_boxes.device().type, device);
   EXPECT_EQ(result.scores.device().type, device);
   EXPECT_EQ(result.class_ids.device().type, device);
+  EXPECT_EQ(result.batch_ids.device().type, device);
   EXPECT_EQ(result.boxes.name(), "yolo_boxes");
   EXPECT_EQ(result.nms_boxes.name(), "yolo_nms_boxes");
   EXPECT_EQ(result.scores.name(), "yolo_scores");
   EXPECT_EQ(result.class_ids.name(), "yolo_class_ids");
+  EXPECT_EQ(result.batch_ids.name(), "yolo_batch_ids");
   EXPECT_EQ(result.boxes.shape(), std::vector<int64_t>({3, 4}));
   EXPECT_EQ(result.nms_boxes.shape(), std::vector<int64_t>({3, 4}));
   EXPECT_EQ(result.scores.shape(), std::vector<int64_t>({3}));
   EXPECT_EQ(result.class_ids.shape(), std::vector<int64_t>({3}));
+  EXPECT_EQ(result.batch_ids.shape(), std::vector<int64_t>({3}));
   EXPECT_EQ(CopyFloats(result.boxes),
             std::vector<float>({0.0F, 0.0F, 10.0F, 10.0F, 1.0F, 1.0F, 11.0F,
                                 11.0F, 16.0F, 16.0F, 24.0F, 24.0F}));
@@ -99,6 +120,7 @@ void ExpectYoloV8DecodedResult(const YoloDecodeResult& result,
                                 11.0F, 116.0F, 116.0F, 124.0F, 124.0F}));
   EXPECT_EQ(CopyFloats(result.scores), std::vector<float>({0.9F, 0.8F, 0.95F}));
   EXPECT_EQ(CopyInt64s(result.class_ids), std::vector<int64_t>({0, 0, 1}));
+  EXPECT_EQ(CopyInt64s(result.batch_ids), std::vector<int64_t>({0, 0, 0}));
 }
 
 TEST(YoloDecodeTest, DecodesYoloV8ChannelFirstPredictionsForNms) {
@@ -139,6 +161,32 @@ TEST(YoloDecodeTest, DecodesYoloV5ObjectnessScores) {
                 {0.0F, 0.0F, 10.0F, 10.0F, 101.0F, 101.0F, 111.0F, 111.0F}));
   EXPECT_EQ(CopyFloats(result.scores), std::vector<float>({0.4F, 0.54F}));
   EXPECT_EQ(CopyInt64s(result.class_ids), std::vector<int64_t>({0, 1}));
+  EXPECT_EQ(CopyInt64s(result.batch_ids), std::vector<int64_t>({0, 0}));
+}
+
+TEST(YoloDecodeTest, DecodesYoloV8MultiBatchWithoutCrossBatchNms) {
+  Tensor predictions = MakeCpuFloatTensor(
+      {2, 6, 2}, YoloV8TwoBatchChannelFirstPredictions(), "predictions");
+
+  YoloDecodeResult result =
+      YoloDecode(predictions, MakeOptions(YoloVersion::kYoloV8));
+
+  EXPECT_EQ(result.boxes.shape(), std::vector<int64_t>({4, 4}));
+  EXPECT_EQ(result.nms_boxes.shape(), std::vector<int64_t>({4, 4}));
+  EXPECT_EQ(result.scores.shape(), std::vector<int64_t>({4}));
+  EXPECT_EQ(result.class_ids.shape(), std::vector<int64_t>({4}));
+  EXPECT_EQ(result.batch_ids.shape(), std::vector<int64_t>({4}));
+  EXPECT_EQ(CopyFloats(result.scores),
+            std::vector<float>({0.9F, 0.8F, 0.85F, 0.7F}));
+  EXPECT_EQ(CopyInt64s(result.class_ids), std::vector<int64_t>({0, 0, 0, 0}));
+  EXPECT_EQ(CopyInt64s(result.batch_ids), std::vector<int64_t>({0, 0, 1, 1}));
+  EXPECT_EQ(CopyFloats(result.nms_boxes),
+            std::vector<float>({0.0F, 0.0F, 10.0F, 10.0F, 1.0F, 1.0F, 11.0F,
+                                11.0F, 200.0F, 200.0F, 210.0F, 210.0F, 201.0F,
+                                201.0F, 211.0F, 211.0F}));
+
+  Tensor keep = Nms(result.nms_boxes, result.scores, 0.5F);
+  EXPECT_EQ(CopyInt64s(keep), std::vector<int64_t>({0, 2}));
 }
 
 TEST(YoloDecodeTest, AllowsEmptyDecodedResults) {
@@ -152,20 +200,18 @@ TEST(YoloDecodeTest, AllowsEmptyDecodedResults) {
   EXPECT_EQ(result.nms_boxes.shape(), std::vector<int64_t>({0, 4}));
   EXPECT_EQ(result.scores.shape(), std::vector<int64_t>({0}));
   EXPECT_EQ(result.class_ids.shape(), std::vector<int64_t>({0}));
+  EXPECT_EQ(result.batch_ids.shape(), std::vector<int64_t>({0}));
 }
 
 TEST(YoloDecodeTest, RejectsInvalidInputs) {
   Tensor predictions = MakeCpuFloatTensor(
       {1, 6, 4}, YoloV8ChannelFirstPredictions(), "predictions");
   Tensor bad_rank = MakeCpuFloatTensor({6, 4}, YoloV8ChannelFirstPredictions());
-  Tensor bad_batch =
-      MakeCpuFloatTensor({2, 6, 4}, std::vector<float>(48, 0.0F));
   Tensor bad_yolo_v5_channels =
       MakeCpuFloatTensor({1, 5, 4}, std::vector<float>(20, 0.0F));
 
   EXPECT_THROW(static_cast<void>(YoloDecode(Tensor{})), std::invalid_argument);
   EXPECT_THROW(static_cast<void>(YoloDecode(bad_rank)), std::invalid_argument);
-  EXPECT_THROW(static_cast<void>(YoloDecode(bad_batch)), std::invalid_argument);
   EXPECT_THROW(static_cast<void>(YoloDecode(bad_yolo_v5_channels,
                                             MakeOptions(YoloVersion::kYoloV5))),
                std::invalid_argument);
@@ -232,6 +278,25 @@ TEST(YoloDecodeTest, DecodesCudaYoloV5Predictions) {
   EXPECT_EQ(result.boxes.shape(), std::vector<int64_t>({2, 4}));
   EXPECT_EQ(CopyFloats(result.scores), std::vector<float>({0.4F, 0.54F}));
   EXPECT_EQ(CopyInt64s(result.class_ids), std::vector<int64_t>({0, 1}));
+  EXPECT_EQ(CopyInt64s(result.batch_ids), std::vector<int64_t>({0, 0}));
+}
+
+TEST(YoloDecodeTest, DecodesCudaYoloV8MultiBatchWithoutCrossBatchNms) {
+  if (!HasUsableCudaDevice()) {
+    GTEST_SKIP() << "CUDA postprocess is unavailable";
+  }
+  ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+  Tensor predictions = MakeCudaFloatTensor(
+      {2, 6, 2}, YoloV8TwoBatchChannelFirstPredictions(), "predictions");
+
+  YoloDecodeResult result =
+      YoloDecode(predictions, MakeOptions(YoloVersion::kYoloV8));
+
+  EXPECT_EQ(result.boxes.device().type, DeviceType::kCuda);
+  EXPECT_EQ(result.boxes.shape(), std::vector<int64_t>({4, 4}));
+  EXPECT_EQ(CopyInt64s(result.batch_ids), std::vector<int64_t>({0, 0, 1, 1}));
+  Tensor keep = Nms(result.nms_boxes, result.scores, 0.5F);
+  EXPECT_EQ(CopyInt64s(keep), std::vector<int64_t>({0, 2}));
 }
 
 #endif

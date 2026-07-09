@@ -50,7 +50,7 @@ ImageDesc MakeOpenCvCudaImageDesc(const cv::cuda::GpuMat& image) {
   }
 
   const int channels = image.channels();
-  return ImageDesc{
+  ImageDesc desc{
       ImageSize{image.cols, image.rows},
       OpenCvChannelsToPixelFormat(channels),
       OpenCvDepthToDataType(image.depth()),
@@ -58,6 +58,8 @@ ImageDesc MakeOpenCvCudaImageDesc(const cv::cuda::GpuMat& image) {
       ImageMemoryKind::kCuda,
       {ImagePlaneDesc{image.step, image.elemSize()}},
   };
+  desc.device_id = cv::cuda::getDevice();
+  return desc;
 }
 
 }  // namespace

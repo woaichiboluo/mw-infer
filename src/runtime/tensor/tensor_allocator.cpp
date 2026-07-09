@@ -235,7 +235,7 @@ PooledTensorAllocator::PooledTensorAllocator()
 
 PooledTensorAllocator::PooledTensorAllocator(
     std::unique_ptr<TensorAllocator> upstream)
-    : upstream_(std::move(upstream)), state_(std::make_unique<State>()) {
+    : upstream_(std::move(upstream)), state_(std::make_shared<State>()) {
   if (!upstream_) {
     throw std::invalid_argument("Pooled tensor allocator upstream is null");
   }
@@ -275,7 +275,7 @@ Tensor PooledTensorAllocator::Allocate(TensorDesc desc) {
 
   void* data = block->data;
   const std::size_t capacity_bytes = block->capacity_bytes;
-  State* state = state_.get();
+  std::shared_ptr<State> state = state_;
   return Tensor::FromBuffer(std::move(desc), data, capacity_bytes,
                             [state, block = std::move(block)](void*) {
                               state->free_blocks.push_back(block);

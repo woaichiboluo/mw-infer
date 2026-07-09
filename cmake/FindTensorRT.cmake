@@ -87,8 +87,8 @@ if(TENSORRT_VERSION_HEADER)
   elseif(TensorRT_VERSION_MAJOR EQUAL 10)
     set(TensorRT_API_FAMILY 10)
   else()
-    message(FATAL_ERROR
-            "MwInfer supports TensorRT 8.x and 10.x. Found TensorRT ${TensorRT_VERSION}.")
+    set(TensorRT_API_FAMILY "${TensorRT_VERSION_MAJOR}")
+    set(TensorRT_VERSION_UNSUPPORTED TRUE)
   endif()
 endif()
 
@@ -98,6 +98,18 @@ find_package_handle_standard_args(
                          TENSORRT_NVINFER_LIBRARY
                          TENSORRT_NVINFER_PLUGIN_LIBRARY
            VERSION_VAR TensorRT_VERSION)
+
+if(TensorRT_FOUND AND TensorRT_VERSION_UNSUPPORTED)
+  if(TensorRT_FIND_REQUIRED)
+    message(FATAL_ERROR
+            "MwInfer supports TensorRT 8.x and 10.x. Found TensorRT ${TensorRT_VERSION}.")
+  endif()
+  if(NOT TensorRT_FIND_QUIETLY)
+    message(STATUS
+            "Found unsupported TensorRT ${TensorRT_VERSION}; TensorRT support is disabled.")
+  endif()
+  set(TensorRT_FOUND FALSE)
+endif()
 
 set(_TENSORRT_COMPILE_DEFINITIONS
     "MW_INFER_TENSORRT_VERSION_MAJOR=${TensorRT_VERSION_MAJOR}"
