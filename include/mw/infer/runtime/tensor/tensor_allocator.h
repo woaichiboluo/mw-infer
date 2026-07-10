@@ -34,6 +34,8 @@ class DirectTensorAllocator final : public TensorAllocator {
 
 class PooledTensorAllocator final : public TensorAllocator {
  public:
+  // The allocator is single-thread-affine. Returned tensors may be destroyed
+  // on other threads and may outlive the allocator.
   PooledTensorAllocator();
   explicit PooledTensorAllocator(std::unique_ptr<TensorAllocator> upstream);
   ~PooledTensorAllocator() override;
@@ -47,10 +49,10 @@ class PooledTensorAllocator final : public TensorAllocator {
   void Clear();
 
  private:
-  struct State;
+  struct Block;
 
   std::unique_ptr<TensorAllocator> upstream_;
-  std::shared_ptr<State> state_;
+  std::vector<std::shared_ptr<Block>> blocks_;
 };
 
 }  // namespace mw::infer

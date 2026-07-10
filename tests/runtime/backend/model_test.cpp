@@ -67,6 +67,68 @@ class FakeBackendAdapter final : public BackendAdapter {
   }
 };
 
+class CountingTensorAllocator final : public TensorAllocator {
+ public:
+  bool Supports(Device device) const override {
+    return TensorAllocator::Default().Supports(device);
+  }
+
+  Tensor Allocate(TensorDesc desc) override {
+    Tensor tensor = TensorAllocator::Default().Allocate(std::move(desc));
+    allocated_data_.push_back(tensor.data());
+    return tensor;
+  }
+
+  std::size_t allocation_count() const { return allocated_data_.size(); }
+  const std::vector<void*>& allocated_data() const { return allocated_data_; }
+
+ private:
+  std::vector<void*> allocated_data_;
+};
+
+class AllocatorFallbackBackend final : public IBackend {
+ public:
+  explicit AllocatorFallbackBackend(Model model)
+      : IBackend(std::move(model), Device{DeviceType::kCpu, 0}) {}
+
+  std::vector<Tensor> Infer(const std::vector<Tensor>& inputs) override {
+    ++infer_count_;
+    last_input_count_ = inputs.size();
+
+    std::vector<Tensor> outputs;
+    outputs.push_back(MakeOutput("first", 1.0F));
+    outputs.push_back(MakeOutput("second", 2.0F));
+    return outputs;
+  }
+
+  std::size_t infer_count() const { return infer_count_; }
+  std::size_t last_input_count() const { return last_input_count_; }
+
+ private:
+  static Tensor MakeOutput(std::string name, float value) {
+    TensorDesc desc;
+    desc.info.name = std::move(name);
+    desc.info.data_type = DataType::kFloat32;
+    desc.info.shape = {1};
+    desc.device = Device{DeviceType::kCpu, 0};
+    Tensor output = Tensor::Allocate(std::move(desc));
+    output.data<float>()[0] = value;
+    return output;
+  }
+
+  std::size_t infer_count_ = 0;
+  std::size_t last_input_count_ = 0;
+};
+
+Tensor MakeInput(std::string name, float* data) {
+  TensorDesc desc;
+  desc.info.name = std::move(name);
+  desc.info.data_type = DataType::kFloat32;
+  desc.info.shape = {1};
+  desc.device = Device{DeviceType::kCpu, 0};
+  return Tensor::FromExternal(std::move(desc), data, sizeof(*data));
+}
+
 TEST(ModelTest, CreatesModelFromPath) {
   Model model = ModelFromPath("models/add.ONNX");
 
@@ -157,6 +219,49 @@ TEST(ModelTest, SingleTensorInferForwardsToMultiInputInfer) {
 
   EXPECT_EQ(backend.last_input_count(), 1U);
   EXPECT_EQ(backend.last_input_name(), "input");
+}
+
+TEST(ModelTest, SingleTensorAllocatorInferUsesProvidedAllocator) {
+  Model model = ModelFromMemory(ModelFormat::kOnnx, "data", 4, nullptr, "fake");
+  AllocatorFallbackBackend backend(std::move(model));
+  IBackend& base = backend;
+  CountingTensorAllocator allocator;
+  float input_value = 1.0F;
+  Tensor input = MakeInput("input", &input_value);
+
+  std::vector<Tensor> outputs = base.Infer(input, allocator);
+
+  EXPECT_EQ(backend.infer_count(), 1U);
+  EXPECT_EQ(backend.last_input_count(), 1U);
+  ASSERT_EQ(outputs.size(), 2U);
+  ASSERT_EQ(allocator.allocation_count(), outputs.size());
+  EXPECT_EQ(outputs[0].data(), allocator.allocated_data()[0]);
+  EXPECT_EQ(outputs[1].data(), allocator.allocated_data()[1]);
+  EXPECT_FLOAT_EQ(outputs[0].data<float>()[0], 1.0F);
+  EXPECT_FLOAT_EQ(outputs[1].data<float>()[0], 2.0F);
+}
+
+TEST(ModelTest, MultiTensorAllocatorInferUsesProvidedAllocator) {
+  Model model = ModelFromMemory(ModelFormat::kOnnx, "data", 4, nullptr, "fake");
+  AllocatorFallbackBackend backend(std::move(model));
+  IBackend& base = backend;
+  CountingTensorAllocator allocator;
+  float first_value = 1.0F;
+  float second_value = 2.0F;
+  std::vector<Tensor> inputs;
+  inputs.push_back(MakeInput("first", &first_value));
+  inputs.push_back(MakeInput("second", &second_value));
+
+  std::vector<Tensor> outputs = base.Infer(inputs, allocator);
+
+  EXPECT_EQ(backend.infer_count(), 1U);
+  EXPECT_EQ(backend.last_input_count(), 2U);
+  ASSERT_EQ(outputs.size(), 2U);
+  ASSERT_EQ(allocator.allocation_count(), outputs.size());
+  EXPECT_EQ(outputs[0].data(), allocator.allocated_data()[0]);
+  EXPECT_EQ(outputs[1].data(), allocator.allocated_data()[1]);
+  EXPECT_FLOAT_EQ(outputs[0].data<float>()[0], 1.0F);
+  EXPECT_FLOAT_EQ(outputs[1].data<float>()[0], 2.0F);
 }
 
 TEST(ModelTest, RejectsInvalidSources) {

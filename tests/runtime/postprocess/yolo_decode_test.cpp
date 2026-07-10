@@ -145,6 +145,16 @@ TEST(YoloDecodeTest, DecodesYoloV11LikeYoloV8) {
   ExpectYoloV8DecodedResult(result, DeviceType::kCpu);
 }
 
+TEST(YoloDecodeTest, DecodesYoloV26OneToManyLikeYoloV8) {
+  Tensor predictions = MakeCpuFloatTensor(
+      {1, 4, 6}, YoloV8CandidateFirstPredictions(), "predictions");
+
+  YoloDecodeResult result =
+      YoloDecode(predictions, MakeOptions(YoloVersion::kYoloV26));
+
+  ExpectYoloV8DecodedResult(result, DeviceType::kCpu);
+}
+
 TEST(YoloDecodeTest, DecodesYoloV5ObjectnessScores) {
   Tensor predictions = MakeCpuFloatTensor(
       {1, 3, 7}, YoloV5CandidateFirstPredictions(), "predictions");

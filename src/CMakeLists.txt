@@ -12,7 +12,8 @@ add_library(MwInferRuntime STATIC runtime/backend/backend.cpp
                                  runtime/postprocess/segmentation.cc
                                  runtime/postprocess/softmax.cpp
                                  runtime/postprocess/topk.cpp
-                                 runtime/postprocess/yolo_decode.cpp)
+                                 runtime/postprocess/yolo_decode.cpp
+                                 runtime/postprocess/yolo_seg_decode.cc)
 add_library(MwInfer::Runtime ALIAS MwInferRuntime)
 
 set_target_properties(MwInferRuntime PROPERTIES EXPORT_NAME Runtime)
@@ -37,7 +38,11 @@ endif()
 
 include(CheckLanguage)
 
-find_package(CUDAToolkit QUIET)
+if(MW_INFER_ENABLE_TENSORRT)
+  find_package(CUDAToolkit REQUIRED)
+else()
+  find_package(CUDAToolkit QUIET)
+endif()
 
 set(MW_INFER_DEPENDENCY_CUDATOOLKIT_STATUS "not found" PARENT_SCOPE)
 
@@ -140,7 +145,8 @@ if(TARGET CUDA::cudart)
                                           runtime/postprocess/segmentation.cu
                                           runtime/postprocess/softmax.cu
                                           runtime/postprocess/topk.cu
-                                          runtime/postprocess/yolo_decode.cu)
+                                          runtime/postprocess/yolo_decode.cu
+                                          runtime/postprocess/yolo_seg_decode.cu)
     target_compile_definitions(MwInferRuntime
                                PUBLIC MW_INFER_HAS_CUDA_PREPROCESS=1
                                       MW_INFER_HAS_CUDA_POSTPROCESS=1
@@ -177,28 +183,21 @@ if(TARGET ONNXRuntime::ONNXRuntime)
   endif()
 endif()
 
-find_package(TensorRT QUIET)
-
-set(MW_INFER_DEPENDENCY_TENSORRT_STATUS "not found" PARENT_SCOPE)
-
-if(TensorRT_FOUND)
+if(MW_INFER_ENABLE_TENSORRT)
+  find_package(TensorRT REQUIRED)
   set(MW_INFER_DEPENDENCY_TENSORRT_STATUS
       "found ${TensorRT_VERSION}" PARENT_SCOPE)
-  if(TARGET CUDA::cudart AND TensorRT_API_FAMILY EQUAL 10)
-    set(MW_INFER_FEATURE_TENSORRT_BACKEND_STATUS "enabled" PARENT_SCOPE)
-    target_sources(MwInferRuntime PRIVATE runtime/backend/tensorrt_backend.cpp)
-    target_compile_definitions(MwInferRuntime
-                               PRIVATE MW_INFER_HAS_TENSORRT_BACKEND=1)
-    target_link_libraries(MwInferRuntime PUBLIC TensorRT::nvinfer
-                                                TensorRT::nvinfer_plugin)
-  elseif(NOT TARGET CUDA::cudart)
-    set(MW_INFER_FEATURE_TENSORRT_BACKEND_STATUS
-        "disabled (CUDA runtime not found)" PARENT_SCOPE)
-  else()
-    set(MW_INFER_FEATURE_TENSORRT_BACKEND_STATUS
-        "disabled (TensorRT API family ${TensorRT_API_FAMILY} unsupported)"
-        PARENT_SCOPE)
-  endif()
+  set(MW_INFER_FEATURE_TENSORRT_BACKEND_STATUS "enabled" PARENT_SCOPE)
+  target_sources(MwInferRuntime PRIVATE runtime/backend/tensorrt_backend.cpp)
+  target_compile_definitions(
+    MwInferRuntime
+    PRIVATE MW_INFER_HAS_TENSORRT_BACKEND=1
+            MW_INFER_TENSORRT_VERSION_MAJOR=${TensorRT_VERSION_MAJOR}
+            MW_INFER_TENSORRT_VERSION_MINOR=${TensorRT_VERSION_MINOR}
+            MW_INFER_TENSORRT_VERSION_PATCH=${TensorRT_VERSION_PATCH}
+            MW_INFER_TENSORRT_API_FAMILY=${TensorRT_API_FAMILY})
+  target_link_libraries(MwInferRuntime PUBLIC TensorRT::nvinfer
+                                              TensorRT::nvinfer_plugin)
 endif()
 
 install(TARGETS MwInferRuntime EXPORT MwInferTargets)

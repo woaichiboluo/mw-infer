@@ -4,7 +4,6 @@
 #include <cuda_runtime_api.h>
 #endif
 
-#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -211,15 +210,10 @@ void Tensor::CopyElementToHost(std::size_t element_offset, void* output,
   throw std::invalid_argument("Tensor device is unsupported");
 }
 
-struct PooledTensorAllocator::State {
-  struct Block {
-    Tensor owner;
-    Device device;
-    void* data = nullptr;
-    std::size_t capacity_bytes = 0;
-  };
+struct PooledTensorAllocator::Block {
+  explicit Block(Tensor storage) : storage(std::move(storage)) {}
 
-  std::vector<std::shared_ptr<Block>> free_blocks;
+  Tensor storage;
 };
 
 namespace {
@@ -235,7 +229,7 @@ PooledTensorAllocator::PooledTensorAllocator()
 
 PooledTensorAllocator::PooledTensorAllocator(
     std::unique_ptr<TensorAllocator> upstream)
-    : upstream_(std::move(upstream)), state_(std::make_shared<State>()) {
+    : upstream_(std::move(upstream)) {
   if (!upstream_) {
     throw std::invalid_argument("Pooled tensor allocator upstream is null");
   }
@@ -253,35 +247,56 @@ Tensor PooledTensorAllocator::Allocate(TensorDesc desc) {
   }
 
   const std::size_t bytes = TensorBytes(desc);
-  auto& free_blocks = state_->free_blocks;
-  auto block = std::shared_ptr<State::Block>();
-  const auto block_it = std::find_if(
-      free_blocks.begin(), free_blocks.end(),
-      [device = desc.device, bytes](const std::shared_ptr<State::Block>& item) {
-        return item && SameDevice(item->device, device) &&
-               item->capacity_bytes >= bytes;
-      });
-  if (block_it != free_blocks.end()) {
-    block = std::move(*block_it);
-    free_blocks.erase(block_it);
-  } else {
-    Tensor owner = upstream_->Allocate(desc);
-    block = std::make_shared<State::Block>();
-    block->device = owner.device();
-    block->data = owner.data();
-    block->capacity_bytes = owner.capacity_bytes();
-    block->owner = std::move(owner);
+  if (bytes == 0) {
+    return upstream_->Allocate(std::move(desc));
   }
 
-  void* data = block->data;
-  const std::size_t capacity_bytes = block->capacity_bytes;
-  std::shared_ptr<State> state = state_;
-  return Tensor::FromBuffer(std::move(desc), data, capacity_bytes,
-                            [state, block = std::move(block)](void*) {
-                              state->free_blocks.push_back(block);
-                            });
+  auto best_fit = blocks_.end();
+  auto replacement = blocks_.end();
+  for (auto block_it = blocks_.begin(); block_it != blocks_.end(); ++block_it) {
+    // The pool owns one reference. Additional references belong to tensors or
+    // views that still use this block.
+    if (block_it->use_count() != 1 ||
+        !SameDevice((*block_it)->storage.device(), desc.device)) {
+      continue;
+    }
+
+    const std::size_t capacity_bytes = (*block_it)->storage.capacity_bytes();
+    if (capacity_bytes >= bytes) {
+      if (best_fit == blocks_.end() ||
+          capacity_bytes < (*best_fit)->storage.capacity_bytes()) {
+        best_fit = block_it;
+      }
+    } else if (replacement == blocks_.end() ||
+               capacity_bytes > (*replacement)->storage.capacity_bytes()) {
+      replacement = block_it;
+    }
+  }
+
+  std::shared_ptr<Block> block;
+  if (best_fit != blocks_.end()) {
+    block = *best_fit;
+  } else {
+    if (replacement != blocks_.end()) {
+      // Release an idle undersized block before allocating its replacement so
+      // growing dynamic shapes do not require both buffers to coexist.
+      blocks_.erase(replacement);
+    }
+    block = std::make_shared<Block>(upstream_->Allocate(desc));
+    // An idle undersized block is replaced rather than accumulated. Therefore,
+    // each device's block count grows only when all of its blocks are active.
+    blocks_.push_back(block);
+  }
+
+  std::shared_ptr<void> owner = block;
+  return Tensor::FromExternal(std::move(desc), block->storage.data(),
+                              block->storage.capacity_bytes(),
+                              std::move(owner));
 }
 
-void PooledTensorAllocator::Clear() { state_->free_blocks.clear(); }
+void PooledTensorAllocator::Clear() {
+  std::vector<std::shared_ptr<Block>> blocks;
+  blocks.swap(blocks_);
+}
 
 }  // namespace mw::infer

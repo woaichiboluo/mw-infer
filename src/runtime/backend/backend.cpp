@@ -19,6 +19,15 @@ std::unique_ptr<BackendAdapter> CreateOnnxGpuBackendAdapter();
 std::unique_ptr<BackendAdapter> CreateTensorRtBackendAdapter();
 #endif
 
+std::vector<Tensor> IBackend::Infer(const std::vector<Tensor>& inputs,
+                                    TensorAllocator& allocator) {
+  std::vector<Tensor> outputs = Infer(inputs);
+  for (Tensor& output : outputs) {
+    output = output.CopyTo(output.device(), allocator);
+  }
+  return outputs;
+}
+
 BackendFactory::BackendFactory() {
 #if defined(MW_INFER_HAS_ONNXRUNTIME_BACKEND)
   AddAdapter(CreateOnnxCpuBackendAdapter());

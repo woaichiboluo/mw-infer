@@ -5,6 +5,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -40,6 +41,49 @@ class CpuOnlyTensorAllocationAdapter final : public TensorAllocationAdapter {
     throw std::logic_error("CPU-only test adapter should not allocate");
   }
 };
+
+struct AllocationCounts {
+  std::size_t allocations = 0;
+  std::size_t releases = 0;
+  std::size_t live_bytes = 0;
+  std::size_t peak_live_bytes = 0;
+  std::vector<std::size_t> released_bytes;
+};
+
+class CountingTensorAllocator final : public TensorAllocator {
+ public:
+  explicit CountingTensorAllocator(std::shared_ptr<AllocationCounts> counts)
+      : counts_(std::move(counts)) {}
+
+  bool Supports(Device device) const override {
+    return device.type == DeviceType::kCpu;
+  }
+
+  Tensor Allocate(TensorDesc desc) override {
+    const std::size_t bytes = TensorBytes(desc);
+    void* data = ::operator new(bytes);
+    ++counts_->allocations;
+    counts_->live_bytes += bytes;
+    if (counts_->live_bytes > counts_->peak_live_bytes) {
+      counts_->peak_live_bytes = counts_->live_bytes;
+    }
+    std::shared_ptr<void> owner(data, [bytes, counts = counts_](void* ptr) {
+      ++counts->releases;
+      counts->live_bytes -= bytes;
+      counts->released_bytes.push_back(bytes);
+      ::operator delete(ptr);
+    });
+    return Tensor::FromExternal(std::move(desc), data, bytes, std::move(owner));
+  }
+
+ private:
+  std::shared_ptr<AllocationCounts> counts_;
+};
+
+std::unique_ptr<TensorAllocator> MakeCountingAllocator(
+    const std::shared_ptr<AllocationCounts>& counts) {
+  return std::make_unique<CountingTensorAllocator>(counts);
+}
 
 std::vector<std::unique_ptr<TensorAllocationAdapter>>
 MakeCpuOnlyTestAdapters() {
@@ -297,30 +341,195 @@ TEST(TensorTest, PooledTensorAllocatorReusesReleasedBlocks) {
 TEST(TensorTest, PooledTensorAllocatorGrowsWhenReleasedBlockIsTooSmall) {
   PooledTensorAllocator allocator;
 
-  void* small_data = nullptr;
   {
     Tensor small = Tensor::Allocate(MakeDescWithShape({4, 3, 2, 2}), allocator);
-    small_data = small.data();
     EXPECT_EQ(small.capacity_bytes(), 192U);
   }
 
   Tensor larger = Tensor::Allocate(MakeDescWithShape({8, 3, 2, 2}), allocator);
   EXPECT_NE(larger.data(), nullptr);
-  EXPECT_NE(larger.data(), small_data);
   EXPECT_EQ(larger.bytes(), 384U);
   EXPECT_EQ(larger.capacity_bytes(), 384U);
 }
 
 TEST(TensorTest, PooledTensorCanOutliveAllocator) {
+  auto counts = std::make_shared<AllocationCounts>();
   Tensor tensor;
   {
-    PooledTensorAllocator allocator;
+    PooledTensorAllocator allocator(MakeCountingAllocator(counts));
     tensor = Tensor::Allocate(MakeDesc(), allocator);
     ASSERT_FALSE(tensor.empty());
     EXPECT_NE(tensor.data(), nullptr);
   }
 
+  EXPECT_EQ(counts->releases, 0U);
   tensor = Tensor();
+  EXPECT_EQ(counts->releases, 1U);
+}
+
+TEST(TensorTest, PooledTensorAllocatorUsesBestFitReleasedBlock) {
+  auto counts = std::make_shared<AllocationCounts>();
+  PooledTensorAllocator allocator(MakeCountingAllocator(counts));
+
+  Tensor large = Tensor::Allocate(MakeDescWithShape({32}), allocator);
+  void* large_data = large.data();
+  Tensor small = Tensor::Allocate(MakeDescWithShape({16}), allocator);
+  void* small_data = small.data();
+  ASSERT_NE(large_data, small_data);
+  large = Tensor();
+  small = Tensor();
+
+  Tensor selected = Tensor::Allocate(MakeDescWithShape({8}), allocator);
+  EXPECT_EQ(selected.data(), small_data);
+  EXPECT_NE(selected.data(), large_data);
+  EXPECT_EQ(counts->allocations, 2U);
+}
+
+TEST(TensorTest, PooledTensorAllocatorKeepsPoolsSeparateByDeviceId) {
+  auto counts = std::make_shared<AllocationCounts>();
+  PooledTensorAllocator allocator(MakeCountingAllocator(counts));
+
+  TensorDesc first_desc = MakeDescWithShape({8});
+  first_desc.device = Device{DeviceType::kCpu, 0};
+  Tensor first = Tensor::Allocate(first_desc, allocator);
+  void* first_data = first.data();
+  first = Tensor();
+
+  TensorDesc second_desc = MakeDescWithShape({16});
+  second_desc.device = Device{DeviceType::kCpu, 1};
+  Tensor second = Tensor::Allocate(second_desc, allocator);
+  second = Tensor();
+  EXPECT_EQ(counts->allocations, 2U);
+  EXPECT_EQ(counts->releases, 0U);
+
+  Tensor reused = Tensor::Allocate(first_desc, allocator);
+  EXPECT_EQ(reused.data(), first_data);
+  EXPECT_EQ(counts->allocations, 2U);
+}
+
+TEST(TensorTest, PooledTensorAllocatorKeepsCopiesAndViewsActive) {
+  auto counts = std::make_shared<AllocationCounts>();
+  PooledTensorAllocator allocator(MakeCountingAllocator(counts));
+
+  Tensor original = Tensor::Allocate(MakeDescWithShape({16}), allocator);
+  void* original_data = original.data();
+  Tensor copy = original;
+  Tensor view = original.View(MakeDescWithShape({8}));
+  original = Tensor();
+
+  Tensor other = Tensor::Allocate(MakeDescWithShape({16}), allocator);
+  EXPECT_NE(other.data(), original_data);
+  EXPECT_EQ(counts->allocations, 2U);
+
+  copy = Tensor();
+  view = Tensor();
+  other = Tensor();
+  allocator.Clear();
+  EXPECT_EQ(counts->releases, 2U);
+}
+
+TEST(TensorTest, PooledTensorAllocatorClearDetachesActiveBlocks) {
+  auto counts = std::make_shared<AllocationCounts>();
+  PooledTensorAllocator allocator(MakeCountingAllocator(counts));
+
+  Tensor active = Tensor::Allocate(MakeDescWithShape({16}), allocator);
+  void* active_data = active.data();
+  allocator.Clear();
+  EXPECT_EQ(counts->releases, 0U);
+
+  Tensor replacement = Tensor::Allocate(MakeDescWithShape({16}), allocator);
+  EXPECT_NE(replacement.data(), active_data);
+  EXPECT_EQ(counts->allocations, 2U);
+
+  active = Tensor();
+  EXPECT_EQ(counts->releases, 1U);
+  replacement = Tensor();
+  EXPECT_EQ(counts->releases, 1U);
+  allocator.Clear();
+  EXPECT_EQ(counts->releases, 2U);
+}
+
+TEST(TensorTest, PooledTensorAllocatorBypassesPoolForZeroSizedTensor) {
+  auto counts = std::make_shared<AllocationCounts>();
+  PooledTensorAllocator allocator(MakeCountingAllocator(counts));
+
+  Tensor cached = Tensor::Allocate(MakeDescWithShape({16}), allocator);
+  void* cached_data = cached.data();
+  cached = Tensor();
+
+  Tensor first_zero = Tensor::Allocate(MakeDescWithShape({0}), allocator);
+  first_zero = Tensor();
+  Tensor second_zero = Tensor::Allocate(MakeDescWithShape({0}), allocator);
+  second_zero = Tensor();
+  EXPECT_EQ(counts->allocations, 3U);
+  EXPECT_EQ(counts->releases, 2U);
+
+  Tensor reused = Tensor::Allocate(MakeDescWithShape({16}), allocator);
+  EXPECT_EQ(reused.data(), cached_data);
+  EXPECT_EQ(counts->allocations, 3U);
+}
+
+TEST(TensorTest, PooledTensorAllocatorDiscardsHistoricalBlocksAsShapesGrow) {
+  auto counts = std::make_shared<AllocationCounts>();
+  {
+    PooledTensorAllocator allocator(MakeCountingAllocator(counts));
+
+    Tensor tensor = Tensor::Allocate(MakeDescWithShape({8}), allocator);
+    tensor = Tensor();
+    EXPECT_EQ(counts->allocations, 1U);
+    EXPECT_EQ(counts->releases, 0U);
+
+    tensor = Tensor::Allocate(MakeDescWithShape({16}), allocator);
+    EXPECT_EQ(counts->allocations, 2U);
+    EXPECT_EQ(counts->releases, 1U);
+    tensor = Tensor();
+
+    tensor = Tensor::Allocate(MakeDescWithShape({32}), allocator);
+    EXPECT_EQ(counts->allocations, 3U);
+    EXPECT_EQ(counts->releases, 2U);
+    EXPECT_EQ(counts->peak_live_bytes, 32U * sizeof(float));
+    tensor = Tensor();
+  }
+
+  EXPECT_EQ(counts->allocations, 3U);
+  EXPECT_EQ(counts->releases, 3U);
+}
+
+TEST(TensorTest, PooledTensorAllocatorReplacesLargestIdleUndersizedBlock) {
+  auto counts = std::make_shared<AllocationCounts>();
+  {
+    PooledTensorAllocator allocator(MakeCountingAllocator(counts));
+
+    Tensor small = Tensor::Allocate(MakeDescWithShape({8}), allocator);
+    Tensor medium = Tensor::Allocate(MakeDescWithShape({16}), allocator);
+    small = Tensor();
+    medium = Tensor();
+
+    Tensor large = Tensor::Allocate(MakeDescWithShape({32}), allocator);
+    ASSERT_EQ(counts->released_bytes.size(), 1U);
+    EXPECT_EQ(counts->released_bytes.front(), 16U * sizeof(float));
+    large = Tensor();
+
+    small = Tensor::Allocate(MakeDescWithShape({4}), allocator);
+    medium = Tensor::Allocate(MakeDescWithShape({24}), allocator);
+    EXPECT_EQ(counts->allocations, 3U);
+  }
+
+  EXPECT_EQ(counts->allocations, 3U);
+  EXPECT_EQ(counts->releases, 3U);
+}
+
+TEST(TensorTest, PooledTensorAllocatorDestructionReleasesIdleBlocks) {
+  auto counts = std::make_shared<AllocationCounts>();
+  {
+    PooledTensorAllocator allocator(MakeCountingAllocator(counts));
+    Tensor tensor = Tensor::Allocate(MakeDesc(), allocator);
+    tensor = Tensor();
+    EXPECT_EQ(counts->releases, 0U);
+  }
+
+  EXPECT_EQ(counts->allocations, 1U);
+  EXPECT_EQ(counts->releases, 1U);
 }
 
 TEST(TensorTest, DirectTensorAllocatorRejectsUnsupportedDevice) {

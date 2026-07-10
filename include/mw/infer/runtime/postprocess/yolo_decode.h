@@ -10,6 +10,7 @@ enum class YoloVersion {
   kYoloV5,
   kYoloV8,
   kYoloV11,
+  kYoloV26,
 };
 
 struct YoloDecodeOptions {

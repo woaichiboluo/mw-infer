@@ -15,6 +15,7 @@
 #endif
 
 #include "mw/infer/runtime/backend/backend.h"
+#include "mw/infer/runtime/tensor/tensor_allocator.h"
 
 namespace mw::infer {
 namespace {
@@ -251,6 +252,26 @@ TEST(OnnxCpuBackendTest, RunsEmbeddedAddModel) {
 
   ASSERT_EQ(outputs.size(), 1U);
   ExpectAddOutput(outputs[0]);
+}
+
+TEST(OnnxCpuBackendTest, UsesExplicitAllocatorForOutputs) {
+  BackendPtr backend = CreateBackend(AddModel());
+  PooledTensorAllocator allocator;
+  std::vector<float> input = {1.0F, 2.0F, 3.0F};
+  Tensor input_tensor = MakeInputTensor(&input);
+
+  void* first_output_data = nullptr;
+  {
+    std::vector<Tensor> outputs = backend->Infer(input_tensor, allocator);
+    ASSERT_EQ(outputs.size(), 1U);
+    first_output_data = outputs.front().data();
+    ExpectAddOutput(outputs.front());
+  }
+
+  std::vector<Tensor> outputs = backend->Infer(input_tensor, allocator);
+  ASSERT_EQ(outputs.size(), 1U);
+  EXPECT_EQ(outputs.front().data(), first_output_data);
+  ExpectAddOutput(outputs.front());
 }
 
 TEST(OnnxCpuBackendTest, BindsMultiInputTensorsByName) {

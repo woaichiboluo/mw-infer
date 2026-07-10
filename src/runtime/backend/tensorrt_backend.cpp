@@ -1,12 +1,14 @@
 #include <NvInferPlugin.h>
 #include <NvInferRuntime.h>
 #include <cuda_runtime_api.h>
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -18,15 +20,61 @@
 namespace mw::infer {
 namespace {
 
+#if !defined(MW_INFER_TENSORRT_API_FAMILY) ||    \
+    !defined(MW_INFER_TENSORRT_VERSION_MAJOR) || \
+    !defined(MW_INFER_TENSORRT_VERSION_MINOR)
+#error "TensorRT version macros are required"
+#endif
+
+#if MW_INFER_TENSORRT_API_FAMILY != 8 && MW_INFER_TENSORRT_API_FAMILY != 10
+#error "Unsupported TensorRT API family"
+#endif
+
 constexpr int32_t kDefaultOptimizationProfileIndex = 0;
 
 class TensorRtLogger final : public nvinfer1::ILogger {
  public:
   void log(Severity severity, const char* message) noexcept override {
-    static_cast<void>(severity);
-    static_cast<void>(message);
+    try {
+      const auto logger = spdlog::default_logger();
+      if (!logger) {
+        return;
+      }
+      switch (severity) {
+        case Severity::kINTERNAL_ERROR:
+          logger->critical("[TensorRT] {}", message);
+          return;
+        case Severity::kERROR:
+          logger->error("[TensorRT] {}", message);
+          return;
+        case Severity::kWARNING:
+          logger->warn("[TensorRT] {}", message);
+          return;
+        case Severity::kINFO:
+          logger->info("[TensorRT] {}", message);
+          return;
+        case Severity::kVERBOSE:
+          logger->debug("[TensorRT] {}", message);
+          return;
+      }
+    } catch (...) {
+      return;
+    }
   }
 };
+
+TensorRtLogger& GetTensorRtLogger() {
+  static TensorRtLogger logger;
+  return logger;
+}
+
+void InitializeTensorRtPlugins() {
+  static const bool initialized =
+      initLibNvInferPlugins(&GetTensorRtLogger(), "");
+  if (!initialized) {
+    throw std::runtime_error("initLibNvInferPlugins failed");
+  }
+}
 
 std::string CudaErrorMessage(cudaError_t status, const char* operation) {
   return std::string(operation) + " failed: " + cudaGetErrorString(status);
@@ -44,27 +92,6 @@ std::unique_ptr<T> CheckTensorRtPtr(T* ptr, const char* operation) {
     throw std::runtime_error(std::string(operation) + " failed");
   }
   return std::unique_ptr<T>(ptr);
-}
-
-void ValidateModel(const Model& model) {
-  if (model.format != ModelFormat::kTensorRT) {
-    throw std::invalid_argument("TensorRT backend requires a TensorRT engine");
-  }
-
-  if (model.source.kind == ModelSourceKind::kPath) {
-    if (model.source.path.empty()) {
-      throw std::invalid_argument("TensorRT engine path is empty");
-    }
-    if (!std::filesystem::exists(model.source.path)) {
-      throw std::invalid_argument("TensorRT engine path does not exist: " +
-                                  model.source.path.string());
-    }
-    return;
-  }
-
-  if (model.source.data == nullptr || model.source.bytes == 0) {
-    throw std::invalid_argument("TensorRT engine memory source is empty");
-  }
 }
 
 std::vector<std::uint8_t> ReadFileBytes(const std::filesystem::path& path) {
@@ -101,14 +128,29 @@ DataType FromTensorRtDataType(nvinfer1::DataType data_type) {
       return DataType::kInt8;
     case nvinfer1::DataType::kINT32:
       return DataType::kInt32;
+#if MW_INFER_TENSORRT_API_FAMILY == 10 ||    \
+    (MW_INFER_TENSORRT_VERSION_MAJOR == 8 && \
+     MW_INFER_TENSORRT_VERSION_MINOR >= 5)
     case nvinfer1::DataType::kUINT8:
       return DataType::kUInt8;
+#endif
+#if MW_INFER_TENSORRT_API_FAMILY == 10
     case nvinfer1::DataType::kINT64:
       return DataType::kInt64;
+#endif
     case nvinfer1::DataType::kBOOL:
+#if MW_INFER_TENSORRT_API_FAMILY == 10 ||    \
+    (MW_INFER_TENSORRT_VERSION_MAJOR == 8 && \
+     MW_INFER_TENSORRT_VERSION_MINOR >= 6)
     case nvinfer1::DataType::kFP8:
+#endif
+#if MW_INFER_TENSORRT_API_FAMILY == 10
     case nvinfer1::DataType::kBF16:
     case nvinfer1::DataType::kINT4:
+#if MW_INFER_TENSORRT_VERSION_MINOR >= 8
+    case nvinfer1::DataType::kFP4:
+#endif
+#endif
       break;
   }
   throw std::invalid_argument("Unsupported TensorRT tensor data type");
@@ -147,10 +189,28 @@ nvinfer1::Dims ToTensorRtDims(const std::vector<int64_t>& shape) {
       throw std::invalid_argument(
           "TensorRT input tensor dimensions must be positive");
     }
+#if MW_INFER_TENSORRT_API_FAMILY == 8
+    if (shape[index] > std::numeric_limits<int32_t>::max()) {
+      throw std::invalid_argument(
+          "TensorRT 8 tensor dimension exceeds int32 range");
+    }
+    dims.d[index] = static_cast<int32_t>(shape[index]);
+#else
     dims.d[index] = shape[index];
+#endif
   }
   return dims;
 }
+
+#if MW_INFER_TENSORRT_API_FAMILY == 8 && defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4996)
+#elif MW_INFER_TENSORRT_API_FAMILY == 8 && defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
+
+#if MW_INFER_TENSORRT_API_FAMILY == 10
 
 void ValidateTensorMemoryLayout(const nvinfer1::ICudaEngine& engine,
                                 const std::string& name) {
@@ -269,6 +329,272 @@ ModelInfo ReadModelInfo(const nvinfer1::ICudaEngine& engine) {
   return info;
 }
 
+#else
+
+void ValidateTensorMemoryLayout(const nvinfer1::ICudaEngine& engine,
+                                int32_t binding_index,
+                                const std::string& name) {
+  const nvinfer1::TensorFormat format = engine.getBindingFormat(binding_index);
+  const int32_t vectorized_dim = engine.getBindingVectorizedDim(binding_index);
+  const int32_t components_per_element =
+      engine.getBindingComponentsPerElement(binding_index);
+
+  if (format == nvinfer1::TensorFormat::kLINEAR && vectorized_dim == -1 &&
+      components_per_element <= 1) {
+    return;
+  }
+
+  const char* format_desc = engine.getBindingFormatDesc(binding_index);
+  std::string message =
+      "TensorRT backend supports dense linear IO tensors only: " + name;
+  if (format_desc != nullptr && format_desc[0] != '\0') {
+    message += " (";
+    message += format_desc;
+    message += ")";
+  }
+  throw std::invalid_argument(message);
+}
+
+TensorInfo ReadTensorInfo(const nvinfer1::ICudaEngine& engine,
+                          int32_t binding_index, const std::string& name) {
+  if (engine.getLocation(binding_index) != nvinfer1::TensorLocation::kDEVICE) {
+    throw std::invalid_argument(
+        "TensorRT backend supports device IO tensors only");
+  }
+  if (engine.isShapeBinding(binding_index)) {
+    throw std::invalid_argument(
+        "TensorRT backend does not support shape inference IO tensors");
+  }
+  if (!engine.isExecutionBinding(binding_index)) {
+    throw std::invalid_argument(
+        "TensorRT backend supports execution IO bindings only");
+  }
+  ValidateTensorMemoryLayout(engine, binding_index, name);
+
+  TensorInfo info;
+  info.name = name;
+  info.data_type =
+      FromTensorRtDataType(engine.getBindingDataType(binding_index));
+  info.shape =
+      FromTensorRtDims(engine.getBindingDimensions(binding_index), true);
+  return info;
+}
+
+ModelProfile ReadProfile(const nvinfer1::ICudaEngine& engine,
+                         const std::vector<TensorInfo>& inputs,
+                         const std::vector<int32_t>& input_binding_indices,
+                         int32_t profile_index) {
+  ModelProfile profile;
+  profile.name = "profile" + std::to_string(profile_index);
+  profile.inputs.reserve(inputs.size());
+  for (std::size_t index = 0; index < inputs.size(); ++index) {
+    const int32_t binding_index = input_binding_indices[index];
+    const nvinfer1::Dims min_shape = engine.getProfileDimensions(
+        binding_index, profile_index, nvinfer1::OptProfileSelector::kMIN);
+    const nvinfer1::Dims opt_shape = engine.getProfileDimensions(
+        binding_index, profile_index, nvinfer1::OptProfileSelector::kOPT);
+    const nvinfer1::Dims max_shape = engine.getProfileDimensions(
+        binding_index, profile_index, nvinfer1::OptProfileSelector::kMAX);
+    if (min_shape.nbDims < 0 || opt_shape.nbDims < 0 || max_shape.nbDims < 0) {
+      continue;
+    }
+
+    TensorShapeRange range;
+    range.name = inputs[index].name;
+    range.min_shape = FromTensorRtDims(min_shape, false);
+    range.opt_shape = FromTensorRtDims(opt_shape, false);
+    range.max_shape = FromTensorRtDims(max_shape, false);
+    profile.inputs.push_back(std::move(range));
+  }
+  return profile;
+}
+
+ModelInfo ReadModelInfo(const nvinfer1::ICudaEngine& engine,
+                        std::vector<int32_t>* input_binding_indices,
+                        std::vector<int32_t>* output_binding_indices) {
+  if (engine.hasImplicitBatchDimension()) {
+    throw std::invalid_argument(
+        "TensorRT 8 backend requires an explicit-batch engine");
+  }
+
+  const int32_t profile_count = engine.getNbOptimizationProfiles();
+  const int32_t binding_count = engine.getNbBindings();
+  if (profile_count <= 0 || binding_count <= 0 ||
+      binding_count % profile_count != 0) {
+    throw std::invalid_argument("TensorRT engine binding layout is invalid");
+  }
+
+  input_binding_indices->clear();
+  output_binding_indices->clear();
+  ModelInfo info;
+  const int32_t bindings_per_profile = binding_count / profile_count;
+  for (int32_t binding_index = 0; binding_index < bindings_per_profile;
+       ++binding_index) {
+    const char* binding_name = engine.getBindingName(binding_index);
+    if (binding_name == nullptr || binding_name[0] == '\0') {
+      throw std::invalid_argument("TensorRT engine has an unnamed IO binding");
+    }
+
+    const std::string name = binding_name;
+    if (engine.bindingIsInput(binding_index)) {
+      info.inputs.push_back(ReadTensorInfo(engine, binding_index, name));
+      input_binding_indices->push_back(binding_index);
+    } else {
+      info.outputs.push_back(ReadTensorInfo(engine, binding_index, name));
+      output_binding_indices->push_back(binding_index);
+    }
+  }
+
+  if (info.inputs.empty()) {
+    throw std::invalid_argument("TensorRT engine has no inputs");
+  }
+  if (info.outputs.empty()) {
+    throw std::invalid_argument("TensorRT engine has no outputs");
+  }
+
+  info.profiles.push_back(ReadProfile(engine, info.inputs,
+                                      *input_binding_indices,
+                                      kDefaultOptimizationProfileIndex));
+  return info;
+}
+
+#endif
+
+class TensorRtApi {
+ public:
+  TensorRtApi(const nvinfer1::ICudaEngine& engine,
+              nvinfer1::IExecutionContext& context)
+      : context_(context) {
+#if MW_INFER_TENSORRT_API_FAMILY == 8
+    model_info_ = ReadModelInfo(engine, &input_binding_indices_,
+                                &output_binding_indices_);
+    binding_addresses_.assign(static_cast<std::size_t>(engine.getNbBindings()),
+                              nullptr);
+#else
+    model_info_ = ReadModelInfo(engine);
+#endif
+  }
+
+  const ModelInfo& model_info() const { return model_info_; }
+
+  void BindInput(std::size_t index, const Tensor& input) {
+#if MW_INFER_TENSORRT_API_FAMILY == 8
+    const int32_t binding_index = input_binding_indices_[index];
+    if (HasDynamicShape(model_info_.inputs[index])) {
+      const nvinfer1::Dims dims = ToTensorRtDims(input.shape());
+      if (!context_.setBindingDimensions(binding_index, dims)) {
+        throw std::invalid_argument(
+            "TensorRT input tensor shape is outside "
+            "the active optimization profile");
+      }
+    }
+    binding_addresses_[static_cast<std::size_t>(binding_index)] =
+        const_cast<void*>(input.data());
+#else
+    const std::string& name = model_info_.inputs[index].name;
+    const nvinfer1::Dims dims = ToTensorRtDims(input.shape());
+    if (!context_.setInputShape(name.c_str(), dims)) {
+      throw std::invalid_argument(
+          "TensorRT input tensor shape is outside "
+          "the active optimization profile");
+    }
+    if (!context_.setInputTensorAddress(name.c_str(), input.data())) {
+      throw std::runtime_error("TensorRT setInputTensorAddress failed: " +
+                               name);
+    }
+#endif
+  }
+
+  void InferShapes() {
+#if MW_INFER_TENSORRT_API_FAMILY == 8
+    if (!context_.allInputDimensionsSpecified()) {
+      throw std::invalid_argument("TensorRT input dimensions are insufficient");
+    }
+    if (!context_.allInputShapesSpecified()) {
+      throw std::invalid_argument("TensorRT input shapes are insufficient");
+    }
+#else
+    const int32_t missing_count = context_.inferShapes(0, nullptr);
+    if (missing_count < 0) {
+      throw std::runtime_error("TensorRT inferShapes failed");
+    }
+    if (missing_count == 0) {
+      return;
+    }
+
+    std::vector<const char*> missing_names(
+        static_cast<std::size_t>(missing_count), nullptr);
+    const int32_t reported_count =
+        context_.inferShapes(missing_count, missing_names.data());
+
+    std::string message = "TensorRT input shapes are insufficient";
+    if (reported_count > 0) {
+      message += ": ";
+      const int32_t limit = std::min(reported_count, missing_count);
+      for (int32_t index = 0; index < limit; ++index) {
+        if (index > 0) {
+          message += ", ";
+        }
+        message += missing_names[static_cast<std::size_t>(index)] != nullptr
+                       ? missing_names[static_cast<std::size_t>(index)]
+                       : "<unknown>";
+      }
+    }
+    throw std::invalid_argument(message);
+#endif
+  }
+
+  std::vector<int64_t> GetOutputShape(std::size_t index) const {
+#if MW_INFER_TENSORRT_API_FAMILY == 8
+    return FromTensorRtDims(
+        context_.getBindingDimensions(output_binding_indices_[index]), false);
+#else
+    return FromTensorRtDims(
+        context_.getTensorShape(model_info_.outputs[index].name.c_str()),
+        false);
+#endif
+  }
+
+  void BindOutput(std::size_t index, void* data) {
+#if MW_INFER_TENSORRT_API_FAMILY == 8
+    const int32_t binding_index = output_binding_indices_[index];
+    binding_addresses_[static_cast<std::size_t>(binding_index)] = data;
+#else
+    const std::string& name = model_info_.outputs[index].name;
+    if (!context_.setTensorAddress(name.c_str(), data)) {
+      throw std::runtime_error("TensorRT setTensorAddress failed: " + name);
+    }
+#endif
+  }
+
+  void Enqueue(cudaStream_t stream) {
+#if MW_INFER_TENSORRT_API_FAMILY == 8
+    if (!context_.enqueueV2(binding_addresses_.data(), stream, nullptr)) {
+      throw std::runtime_error("TensorRT enqueueV2 failed");
+    }
+#else
+    if (!context_.enqueueV3(stream)) {
+      throw std::runtime_error("TensorRT enqueueV3 failed");
+    }
+#endif
+  }
+
+ private:
+  nvinfer1::IExecutionContext& context_;
+  ModelInfo model_info_;
+#if MW_INFER_TENSORRT_API_FAMILY == 8
+  std::vector<int32_t> input_binding_indices_;
+  std::vector<int32_t> output_binding_indices_;
+  std::vector<void*> binding_addresses_;
+#endif
+};
+
+#if MW_INFER_TENSORRT_API_FAMILY == 8 && defined(_MSC_VER)
+#pragma warning(pop)
+#elif MW_INFER_TENSORRT_API_FAMILY == 8 && defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+
 std::size_t FindTensorInfo(const std::vector<TensorInfo>& infos,
                            const std::string& name, const char* kind) {
   const auto iter = std::find_if(
@@ -323,27 +649,18 @@ class TensorRtBackendSession {
       throw std::invalid_argument(
           "TensorRT backend requires a non-negative CUDA device");
     }
-    ValidateModel(model);
     CheckCuda(cudaSetDevice(execution_device_.id), "cudaSetDevice");
 
-    if (!initLibNvInferPlugins(&logger_, "")) {
-      throw std::runtime_error("initLibNvInferPlugins failed");
-    }
-    runtime_ = CheckTensorRtPtr(nvinfer1::createInferRuntime(logger_),
-                                "nvinfer1::createInferRuntime");
+    InitializeTensorRtPlugins();
+    runtime_ =
+        CheckTensorRtPtr(nvinfer1::createInferRuntime(GetTensorRtLogger()),
+                         "nvinfer1::createInferRuntime");
     engine_ = DeserializeEngine(model);
     context_ = CheckTensorRtPtr(engine_->createExecutionContext(),
                                 "ICudaEngine::createExecutionContext");
+    api_ = std::make_unique<TensorRtApi>(*engine_, *context_);
 
-    ModelInfo full_info = ReadModelInfo(*engine_);
-    input_names_.reserve(full_info.inputs.size());
-    for (const TensorInfo& input : full_info.inputs) {
-      input_names_.push_back(input.name);
-    }
-    all_output_names_.reserve(full_info.outputs.size());
-    for (const TensorInfo& output : full_info.outputs) {
-      all_output_names_.push_back(output.name);
-    }
+    ModelInfo full_info = api_->model_info();
     all_output_infos_ = full_info.outputs;
     active_info = ResolveActiveModelInfo(std::move(full_info), output_names,
                                          &return_output_indices_);
@@ -367,22 +684,21 @@ class TensorRtBackendSession {
   }
 
   std::vector<Tensor> Infer(const std::vector<Tensor>& inputs,
-                            const ModelInfo& model_info) {
+                            const ModelInfo& model_info,
+                            TensorAllocator& allocator) {
     CheckCuda(cudaSetDevice(execution_device_.id), "cudaSetDevice");
     std::vector<const Tensor*> ordered_inputs =
         ResolveInputs(inputs, model_info);
     std::vector<Tensor> staged_inputs;
     std::vector<const Tensor*> bound_inputs =
-        StageInputs(ordered_inputs, &staged_inputs);
+        StageInputs(ordered_inputs, allocator, &staged_inputs);
 
     BindInputs(bound_inputs);
     InferShapes();
-    std::vector<Tensor> all_outputs = AllocateOutputs();
+    std::vector<Tensor> all_outputs = AllocateOutputs(allocator);
     BindOutputs(all_outputs);
 
-    if (!context_->enqueueV3(stream_)) {
-      throw std::runtime_error("TensorRT enqueueV3 failed");
-    }
+    api_->Enqueue(stream_);
     CheckCuda(cudaStreamSynchronize(stream_), "cudaStreamSynchronize");
 
     return SelectOutputs(std::move(all_outputs));
@@ -466,7 +782,7 @@ class TensorRtBackendSession {
   }
 
   std::vector<const Tensor*> StageInputs(
-      const std::vector<const Tensor*>& inputs,
+      const std::vector<const Tensor*>& inputs, TensorAllocator& allocator,
       std::vector<Tensor>* staged_inputs) {
     staged_inputs->clear();
     staged_inputs->reserve(inputs.size());
@@ -479,7 +795,7 @@ class TensorRtBackendSession {
         continue;
       }
 
-      staged_inputs->push_back(input->CopyTo(execution_device_));
+      staged_inputs->push_back(input->CopyTo(execution_device_, allocator));
       bound_inputs.push_back(&staged_inputs->back());
     }
     return bound_inputs;
@@ -487,71 +803,28 @@ class TensorRtBackendSession {
 
   void BindInputs(const std::vector<const Tensor*>& inputs) {
     for (std::size_t index = 0; index < inputs.size(); ++index) {
-      const std::string& name = input_names_[index];
-      const nvinfer1::Dims dims = ToTensorRtDims(inputs[index]->shape());
-      if (!context_->setInputShape(name.c_str(), dims)) {
-        throw std::invalid_argument(
-            "TensorRT input tensor shape is outside "
-            "the active optimization profile");
-      }
-      if (!context_->setInputTensorAddress(name.c_str(),
-                                           inputs[index]->data())) {
-        throw std::runtime_error("TensorRT setInputTensorAddress failed: " +
-                                 name);
-      }
+      api_->BindInput(index, *inputs[index]);
     }
   }
 
-  void InferShapes() {
-    const int32_t missing_count = context_->inferShapes(0, nullptr);
-    if (missing_count < 0) {
-      throw std::runtime_error("TensorRT inferShapes failed");
-    }
-    if (missing_count == 0) {
-      return;
-    }
+  void InferShapes() { api_->InferShapes(); }
 
-    std::vector<const char*> missing_names(
-        static_cast<std::size_t>(missing_count), nullptr);
-    const int32_t reported_count =
-        context_->inferShapes(missing_count, missing_names.data());
-
-    std::string message = "TensorRT input shapes are insufficient";
-    if (reported_count > 0) {
-      message += ": ";
-      const int32_t limit = std::min(reported_count, missing_count);
-      for (int32_t index = 0; index < limit; ++index) {
-        if (index > 0) {
-          message += ", ";
-        }
-        message += missing_names[static_cast<std::size_t>(index)] != nullptr
-                       ? missing_names[static_cast<std::size_t>(index)]
-                       : "<unknown>";
-      }
-    }
-    throw std::invalid_argument(message);
-  }
-
-  std::vector<Tensor> AllocateOutputs() {
+  std::vector<Tensor> AllocateOutputs(TensorAllocator& allocator) {
     std::vector<Tensor> outputs;
     outputs.reserve(all_output_infos_.size());
-    for (const TensorInfo& output : all_output_infos_) {
+    for (std::size_t index = 0; index < all_output_infos_.size(); ++index) {
       TensorDesc desc;
-      desc.info = output;
-      desc.info.shape = FromTensorRtDims(
-          context_->getTensorShape(output.name.c_str()), false);
+      desc.info = all_output_infos_[index];
+      desc.info.shape = api_->GetOutputShape(index);
       desc.device = execution_device_;
-      outputs.push_back(Tensor::Allocate(std::move(desc)));
+      outputs.push_back(Tensor::Allocate(std::move(desc), allocator));
     }
     return outputs;
   }
 
   void BindOutputs(std::vector<Tensor>& outputs) {
     for (std::size_t index = 0; index < outputs.size(); ++index) {
-      const std::string& name = all_output_names_[index];
-      if (!context_->setTensorAddress(name.c_str(), outputs[index].data())) {
-        throw std::runtime_error("TensorRT setTensorAddress failed: " + name);
-      }
+      api_->BindOutput(index, outputs[index].data());
     }
   }
 
@@ -565,13 +838,11 @@ class TensorRtBackendSession {
   }
 
   Device execution_device_;
-  TensorRtLogger logger_;
   std::unique_ptr<nvinfer1::IRuntime> runtime_;
   std::unique_ptr<nvinfer1::ICudaEngine> engine_;
   std::unique_ptr<nvinfer1::IExecutionContext> context_;
+  std::unique_ptr<TensorRtApi> api_;
   cudaStream_t stream_ = nullptr;
-  std::vector<std::string> input_names_;
-  std::vector<std::string> all_output_names_;
   std::vector<TensorInfo> all_output_infos_;
   std::vector<std::size_t> return_output_indices_;
 };
@@ -585,7 +856,12 @@ class TensorRtBackend final : public IBackend {
                  mutable_model().info) {}
 
   std::vector<Tensor> Infer(const std::vector<Tensor>& inputs) override {
-    return session_.Infer(inputs, model_info());
+    return Infer(inputs, TensorAllocator::Default());
+  }
+
+  std::vector<Tensor> Infer(const std::vector<Tensor>& inputs,
+                            TensorAllocator& allocator) override {
+    return session_.Infer(inputs, model_info(), allocator);
   }
 
  private:

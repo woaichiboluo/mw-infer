@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <cstddef>
-#include <filesystem>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -25,27 +24,6 @@ struct OnnxBackendSessionOptions {
   int device_id = 0;
   std::vector<std::string> output_names;
 };
-
-void ValidateModel(const Model& model) {
-  if (model.format != ModelFormat::kOnnx) {
-    throw std::invalid_argument("ONNX Runtime backend requires an ONNX model");
-  }
-
-  if (model.source.kind == ModelSourceKind::kPath) {
-    if (model.source.path.empty()) {
-      throw std::invalid_argument("ONNX model path is empty");
-    }
-    if (!std::filesystem::exists(model.source.path)) {
-      throw std::invalid_argument("ONNX model path does not exist: " +
-                                  model.source.path.string());
-    }
-    return;
-  }
-
-  if (model.source.data == nullptr || model.source.bytes == 0) {
-    throw std::invalid_argument("ONNX model memory source is empty");
-  }
-}
 
 DataType FromOrtDataType(ONNXTensorElementDataType data_type) {
   switch (data_type) {
@@ -268,9 +246,7 @@ std::vector<const char*> MakeNamePointers(
   return pointers;
 }
 
-void ValidateOptions(const OnnxBackendSessionOptions& options,
-                     const Model& model) {
-  ValidateModel(model);
+void ValidateOptions(const OnnxBackendSessionOptions& options) {
   if (options.device_id < 0) {
     throw std::invalid_argument("ONNX Runtime CUDA device id is negative");
   }
@@ -336,7 +312,7 @@ class OnnxBackendSession {
       : options_(std::move(options)),
         env_(ORT_LOGGING_LEVEL_WARNING, "MwInfer"),
         session_(nullptr) {
-    ValidateOptions(options_, model);
+    ValidateOptions(options_);
     Ort::SessionOptions session_options = MakeSessionOptions(options_);
     session_ = CreateSession(env_, model, session_options);
     active_info =

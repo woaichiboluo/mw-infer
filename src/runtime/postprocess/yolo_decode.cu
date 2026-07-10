@@ -41,6 +41,7 @@ bool HasObjectness(YoloVersion version) {
       return true;
     case YoloVersion::kYoloV8:
     case YoloVersion::kYoloV11:
+    case YoloVersion::kYoloV26:
       return false;
   }
   throw std::invalid_argument("YOLO version is unsupported");

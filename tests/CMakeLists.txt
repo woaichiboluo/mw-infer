@@ -85,6 +85,9 @@ mw_infer_add_gtest(mw_infer_segmentation_test
 mw_infer_add_gtest(mw_infer_yolo_decode_test
                    runtime/postprocess/yolo_decode_test.cpp
                    runtime_postprocess)
+mw_infer_add_gtest(mw_infer_yolo_seg_decode_test
+                   runtime/postprocess/yolo_seg_decode_test.cc
+                   runtime_postprocess)
 
 if(MW_INFER_FEATURE_OPENCV_ADAPTER_STATUS STREQUAL "enabled")
   mw_infer_add_gtest(mw_infer_opencv_input_test

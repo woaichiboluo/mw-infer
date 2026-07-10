@@ -35,7 +35,15 @@ class IBackend {
   std::vector<Tensor> Infer(const Tensor& input) {
     return Infer(std::vector<Tensor>{input});
   }
+  std::vector<Tensor> Infer(const Tensor& input, TensorAllocator& allocator) {
+    return Infer(std::vector<Tensor>{input}, allocator);
+  }
   virtual std::vector<Tensor> Infer(const std::vector<Tensor>& inputs) = 0;
+  // Returns tensors backed by the requested allocator. The default
+  // implementation copies backend-native outputs; backends may override it to
+  // allocate outputs directly.
+  virtual std::vector<Tensor> Infer(const std::vector<Tensor>& inputs,
+                                    TensorAllocator& allocator);
 
  protected:
   IBackend(Model model, Device execution_device)

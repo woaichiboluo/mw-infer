@@ -204,18 +204,15 @@ TEST(CudaTensorAllocatorTest,
 
   PooledTensorAllocator allocator;
 
-  void* small_data = nullptr;
   {
     Tensor small =
         Tensor::Allocate(MakeCudaDescWithShape({4, 3, 2, 2}), allocator);
-    small_data = small.data();
     EXPECT_EQ(small.capacity_bytes(), 192U);
   }
 
   Tensor larger =
       Tensor::Allocate(MakeCudaDescWithShape({8, 3, 2, 2}), allocator);
   EXPECT_NE(larger.data(), nullptr);
-  EXPECT_NE(larger.data(), small_data);
   EXPECT_EQ(larger.bytes(), 384U);
   EXPECT_EQ(larger.capacity_bytes(), 384U);
   EXPECT_EQ(cudaMemset(larger.data(), 0, larger.bytes()), cudaSuccess);

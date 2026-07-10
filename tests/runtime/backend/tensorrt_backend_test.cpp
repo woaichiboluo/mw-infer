@@ -2,8 +2,10 @@
 #include <cuda_runtime_api.h>
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -14,15 +16,25 @@
 #include <vector>
 
 #include "mw/infer/runtime/backend/backend.h"
+#include "mw/infer/runtime/tensor/tensor_allocator.h"
 
 namespace mw::infer {
 namespace {
 
+#if NV_TENSORRT_MAJOR < 10
+constexpr std::uint32_t kNetworkDefinitionFlags =
+    1U << static_cast<std::uint32_t>(
+        nvinfer1::NetworkDefinitionCreationFlag::kEXPLICIT_BATCH);
+#else
+constexpr std::uint32_t kNetworkDefinitionFlags = 0U;
+#endif
+
 class TestTensorRtLogger final : public nvinfer1::ILogger {
  public:
   void log(Severity severity, const char* message) noexcept override {
-    static_cast<void>(severity);
-    static_cast<void>(message);
+    if (severity <= Severity::kERROR) {
+      std::fprintf(stderr, "TensorRT test error: %s\n", message);
+    }
   }
 };
 
@@ -73,12 +85,15 @@ std::shared_ptr<std::vector<std::uint8_t>> BuildDynamicAddEngine() {
   TestTensorRtLogger logger;
   auto builder = CheckTensorRtPtr(nvinfer1::createInferBuilder(logger),
                                   "createInferBuilder");
-  auto network = CheckTensorRtPtr(builder->createNetworkV2(0),
-                                  "IBuilder::createNetworkV2");
+  auto network =
+      CheckTensorRtPtr(builder->createNetworkV2(kNetworkDefinitionFlags),
+                       "IBuilder::createNetworkV2");
   auto config = CheckTensorRtPtr(builder->createBuilderConfig(),
                                  "IBuilder::createBuilderConfig");
 
+#if NV_TENSORRT_MAJOR > 8 || (NV_TENSORRT_MAJOR == 8 && NV_TENSORRT_MINOR >= 6)
   config->setBuilderOptimizationLevel(0);
+#endif
   nvinfer1::ITensor* lhs =
       network->addInput("lhs", nvinfer1::DataType::kFLOAT, MakeDims({-1, 3}));
   nvinfer1::ITensor* rhs =
@@ -133,12 +148,15 @@ std::shared_ptr<std::vector<std::uint8_t>> BuildStaticIdentityEngine() {
   TestTensorRtLogger logger;
   auto builder = CheckTensorRtPtr(nvinfer1::createInferBuilder(logger),
                                   "createInferBuilder");
-  auto network = CheckTensorRtPtr(builder->createNetworkV2(0),
-                                  "IBuilder::createNetworkV2");
+  auto network =
+      CheckTensorRtPtr(builder->createNetworkV2(kNetworkDefinitionFlags),
+                       "IBuilder::createNetworkV2");
   auto config = CheckTensorRtPtr(builder->createBuilderConfig(),
                                  "IBuilder::createBuilderConfig");
 
+#if NV_TENSORRT_MAJOR > 8 || (NV_TENSORRT_MAJOR == 8 && NV_TENSORRT_MINOR >= 6)
   config->setBuilderOptimizationLevel(0);
+#endif
   nvinfer1::ITensor* input =
       network->addInput("input", nvinfer1::DataType::kFLOAT, MakeDims({2, 3}));
   CheckTrue(input != nullptr, "INetworkDefinition::addInput(input)");
@@ -165,12 +183,15 @@ std::shared_ptr<std::vector<std::uint8_t>> BuildDynamicAddSubEngine() {
   TestTensorRtLogger logger;
   auto builder = CheckTensorRtPtr(nvinfer1::createInferBuilder(logger),
                                   "createInferBuilder");
-  auto network = CheckTensorRtPtr(builder->createNetworkV2(0),
-                                  "IBuilder::createNetworkV2");
+  auto network =
+      CheckTensorRtPtr(builder->createNetworkV2(kNetworkDefinitionFlags),
+                       "IBuilder::createNetworkV2");
   auto config = CheckTensorRtPtr(builder->createBuilderConfig(),
                                  "IBuilder::createBuilderConfig");
 
+#if NV_TENSORRT_MAJOR > 8 || (NV_TENSORRT_MAJOR == 8 && NV_TENSORRT_MINOR >= 6)
   config->setBuilderOptimizationLevel(0);
+#endif
   nvinfer1::ITensor* lhs =
       network->addInput("lhs", nvinfer1::DataType::kFLOAT, MakeDims({-1, 3}));
   nvinfer1::ITensor* rhs =
@@ -353,6 +374,22 @@ TEST(TensorRtBackendTest, SupportsTensorRtEngineOnCudaOnly) {
   EXPECT_FALSE(factory.Supports(model, Device{DeviceType::kCpu, 0}));
 }
 
+TEST(TensorRtBackendTest, RejectsInvalidSerializedEngine) {
+  if (!HasUsableCudaDevice()) {
+    GTEST_SKIP() << "CUDA device is unavailable";
+  }
+
+  const std::array<std::uint8_t, 16> invalid_engine{};
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    EXPECT_THROW(
+        static_cast<void>(CreateBackend(
+            ModelFromMemory(ModelFormat::kTensorRT, invalid_engine.data(),
+                            invalid_engine.size()),
+            CudaDevice())),
+        std::runtime_error);
+  }
+}
+
 TEST(TensorRtBackendTest, RunsStaticSingleInputEngineWithUnnamedTensor) {
   if (!HasUsableCudaDevice()) {
     GTEST_SKIP() << "CUDA device is unavailable";
@@ -407,6 +444,34 @@ TEST(TensorRtBackendTest, RunsMemoryEngineWithCudaInputsAndOutputs) {
   ExpectDynamicAddOutput(backend.get(), 2);
 }
 
+TEST(TensorRtBackendTest, ReusesOutputsWithExplicitPooledAllocator) {
+  if (!HasUsableCudaDevice()) {
+    GTEST_SKIP() << "CUDA device is unavailable";
+  }
+
+  BackendPtr backend = CreateBackend(DynamicAddEngineModel(), CudaDevice());
+  PooledTensorAllocator allocator;
+  const std::vector<float> lhs = Sequence(6, 1.0F);
+  const std::vector<float> rhs = Sequence(6, 100.0F);
+  Tensor lhs_tensor = MakeCudaFloatTensor("lhs", {2, 3}, lhs);
+  Tensor rhs_tensor = MakeCudaFloatTensor("rhs", {2, 3}, rhs);
+
+  void* first_output_data = nullptr;
+  {
+    std::vector<Tensor> outputs =
+        backend->Infer({lhs_tensor, rhs_tensor}, allocator);
+    ASSERT_EQ(outputs.size(), 1U);
+    first_output_data = outputs.front().data();
+    ExpectFloatValues(outputs.front(), Sum(lhs, rhs));
+  }
+
+  std::vector<Tensor> outputs =
+      backend->Infer({lhs_tensor, rhs_tensor}, allocator);
+  ASSERT_EQ(outputs.size(), 1U);
+  EXPECT_EQ(outputs.front().data(), first_output_data);
+  ExpectFloatValues(outputs.front(), Sum(lhs, rhs));
+}
+
 TEST(TensorRtBackendTest, BindsRequestedMultiOutputsInOrder) {
   if (!HasUsableCudaDevice()) {
     GTEST_SKIP() << "CUDA device is unavailable";
@@ -444,8 +509,10 @@ TEST(TensorRtBackendTest, CopiesCpuInputsToExecutionDevice) {
   const std::vector<float> rhs = Sequence(6, 100.0F);
   Tensor lhs_tensor = MakeCpuFloatTensor("lhs", {2, 3}, lhs);
   Tensor rhs_tensor = MakeCpuFloatTensor("rhs", {2, 3}, rhs);
+  PooledTensorAllocator allocator;
 
-  std::vector<Tensor> outputs = backend->Infer({rhs_tensor, lhs_tensor});
+  std::vector<Tensor> outputs =
+      backend->Infer({rhs_tensor, lhs_tensor}, allocator);
 
   ASSERT_EQ(outputs.size(), 1U);
   EXPECT_EQ(outputs[0].device().type, DeviceType::kCuda);
