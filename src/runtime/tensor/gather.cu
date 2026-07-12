@@ -8,6 +8,7 @@
 #include <utility>
 #include <vector>
 
+#include "mw/infer/runtime/execution_stream.h"
 #include "mw/infer/runtime/tensor/gather.h"
 
 namespace mw::infer::tensor_internal {
@@ -88,13 +89,17 @@ __global__ void GatherRowsKernel(const std::uint8_t* input,
 }  // namespace
 
 Tensor RunGatherRowsOnDevice(const Tensor& data, const Tensor& indices,
-                             TensorAllocator& allocator) {
+                             TensorAllocator& allocator,
+                             ExecutionStream* execution_stream) {
   const int row_count = CheckedCount(data.shape()[0], "GatherRows row count");
   const int selected_count =
       CheckedCount(indices.shape()[0], "GatherRows selected count");
   const std::size_t row_bytes = RowBytes(data);
 
   CheckCuda(cudaSetDevice(data.device().id), "cudaSetDevice");
+  const cudaStream_t cuda_stream = execution_stream == nullptr
+                                       ? cudaStream_t{}
+                                       : execution_stream->cuda_handle();
   Tensor output =
       Tensor::Allocate(MakeOutputDesc(data, indices.shape()[0]), allocator);
   if (selected_count == 0) {
@@ -104,8 +109,9 @@ Tensor RunGatherRowsOnDevice(const Tensor& data, const Tensor& indices,
   int* device_error = nullptr;
   CheckCuda(cudaMalloc(&device_error, sizeof(int)), "cudaMalloc");
   try {
-    CheckCuda(cudaMemset(device_error, 0, sizeof(int)), "cudaMemset");
-    GatherRowsKernel<<<selected_count, kThreadsPerBlock>>>(
+    CheckCuda(cudaMemsetAsync(device_error, 0, sizeof(int), cuda_stream),
+              "cudaMemsetAsync");
+    GatherRowsKernel<<<selected_count, kThreadsPerBlock, 0, cuda_stream>>>(
         static_cast<const std::uint8_t*>(data.data()),
         static_cast<const int64_t*>(indices.data()),
         static_cast<std::uint8_t*>(output.data()), row_count, row_bytes,
@@ -113,9 +119,10 @@ Tensor RunGatherRowsOnDevice(const Tensor& data, const Tensor& indices,
     CheckCuda(cudaGetLastError(), "GatherRowsKernel");
 
     int host_error = 0;
-    CheckCuda(cudaMemcpy(&host_error, device_error, sizeof(int),
-                         cudaMemcpyDeviceToHost),
-              "cudaMemcpy");
+    CheckCuda(cudaMemcpyAsync(&host_error, device_error, sizeof(int),
+                              cudaMemcpyDeviceToHost, cuda_stream),
+              "cudaMemcpyAsync");
+    CheckCuda(cudaStreamSynchronize(cuda_stream), "cudaStreamSynchronize");
     CheckCuda(cudaFree(device_error), "cudaFree");
     device_error = nullptr;
     if (host_error != 0) {

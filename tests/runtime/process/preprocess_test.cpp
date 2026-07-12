@@ -1,9 +1,12 @@
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "mw/infer/runtime/process/channel.h"
@@ -121,6 +124,12 @@ bool HasUsableCudaDevice() {
   return cudaGetDeviceCount(&count) == cudaSuccess && count > 0;
 }
 
+void CUDART_CB DelayCudaStream(void* user_data) {
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  static_cast<std::atomic<bool>*>(user_data)->store(true,
+                                                    std::memory_order_release);
+}
+
 std::vector<float> CopyCudaFloatsToHost(const Tensor& tensor) {
   EXPECT_EQ(tensor.device().type, DeviceType::kCuda);
   return CopyCpuFloats(tensor.CopyTo(Device{DeviceType::kCpu, 0}));
@@ -160,7 +169,45 @@ TEST(PreprocessTest, NormalizesCudaBhwcChannels) {
   EXPECT_EQ(output.name(), "data");
   EXPECT_EQ(output.device().type, DeviceType::kCuda);
   ExpectFloatVectorsNear(CopyCudaFloatsToHost(output),
-                         {0.0F, 0.0F, 0.0F, 3.0F, 1.5F, 0.75F});
+                          {0.0F, 0.0F, 0.0F, 3.0F, 1.5F, 0.75F});
+}
+
+TEST(PreprocessTest, EnqueuesCudaOperationsOnExecutionStream) {
+  if (!HasUsableCudaDevice()) {
+    GTEST_SKIP() << "CUDA preprocess is unavailable";
+  }
+  ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+  Tensor input =
+      MakeCpuFloatTensor({1, 1, 2, 3},
+                         {10.0F, 20.0F, 30.0F, 40.0F, 50.0F, 60.0F}, "data")
+          .CopyTo(Device{DeviceType::kCuda, 0});
+  ExecutionStream stream(Device{DeviceType::kCuda, 0});
+  PooledTensorAllocator allocator;
+  {
+    Tensor warm_reordered = ReorderChannels(
+        input, {2, 1, 0}, stream, TensorLayout::kBhwc, allocator);
+    Tensor warm_output = Normalize(
+        warm_reordered, {1.0F, 2.0F, 3.0F}, {1.0F, 2.0F, 4.0F}, stream, 0.1F,
+        TensorLayout::kBhwc, allocator);
+    stream.Synchronize();
+  }
+
+  std::atomic<bool> delay_completed{false};
+  ASSERT_EQ(cudaLaunchHostFunc(stream.cuda_handle(), DelayCudaStream,
+                               &delay_completed),
+            cudaSuccess);
+
+  input = ReorderChannels(input, {2, 1, 0}, stream, TensorLayout::kBhwc,
+                          allocator);
+  input = Normalize(input, {1.0F, 2.0F, 3.0F}, {1.0F, 2.0F, 4.0F}, stream,
+                    0.1F, TensorLayout::kBhwc, allocator);
+  EXPECT_FALSE(delay_completed.load(std::memory_order_acquire));
+  stream.Synchronize();
+
+  EXPECT_TRUE(delay_completed.load(std::memory_order_acquire));
+  EXPECT_EQ(input.capacity_bytes(), input.bytes());
+  ExpectFloatVectorsNear(CopyCudaFloatsToHost(input),
+                         {2.0F, 0.0F, -0.5F, 5.0F, 1.5F, 0.25F});
 }
 
 #endif

@@ -7,12 +7,15 @@
 #include <utility>
 #include <vector>
 
+#include "mw/infer/runtime/execution_stream.h"
+
 namespace mw::infer {
 
 #if defined(MW_INFER_HAS_CUDA_TENSOR_OPS)
 namespace tensor_internal {
 Tensor RunGatherRowsOnDevice(const Tensor& data, const Tensor& indices,
-                             TensorAllocator& allocator);
+                             TensorAllocator& allocator,
+                             ExecutionStream* execution_stream);
 }  // namespace tensor_internal
 #endif
 
@@ -124,14 +127,24 @@ Tensor RunGatherRowsOnHost(const Tensor& data, const Tensor& indices,
 }  // namespace
 
 Tensor GatherRows(const Tensor& data, const Tensor& indices,
-                  TensorAllocator& allocator) {
+                  TensorAllocator& allocator,
+                  ExecutionStream* execution_stream) {
   const GatherRowsLayout layout = ValidateInputs(data, indices);
+  if (execution_stream != nullptr) {
+    const Device stream_device = execution_stream->device();
+    if (stream_device.type != data.device().type ||
+        stream_device.id != data.device().id) {
+      throw std::invalid_argument(
+          "GatherRows execution stream device does not match tensor device");
+    }
+  }
   if (data.device().type == DeviceType::kCpu) {
     return RunGatherRowsOnHost(data, indices, layout, allocator);
   }
   if (data.device().type == DeviceType::kCuda) {
 #if defined(MW_INFER_HAS_CUDA_TENSOR_OPS)
-    return tensor_internal::RunGatherRowsOnDevice(data, indices, allocator);
+    return tensor_internal::RunGatherRowsOnDevice(data, indices, allocator,
+                                                  execution_stream);
 #else
     throw std::runtime_error("CUDA tensor ops are unavailable in this build");
 #endif
@@ -139,9 +152,9 @@ Tensor GatherRows(const Tensor& data, const Tensor& indices,
   throw std::invalid_argument("GatherRows tensor device is unsupported");
 }
 
-Tensor Tensor::GatherRows(const Tensor& indices,
-                          TensorAllocator& allocator) const {
-  return mw::infer::GatherRows(*this, indices, allocator);
+Tensor Tensor::GatherRows(const Tensor& indices, TensorAllocator& allocator,
+                          ExecutionStream* execution_stream) const {
+  return mw::infer::GatherRows(*this, indices, allocator, execution_stream);
 }
 
 }  // namespace mw::infer

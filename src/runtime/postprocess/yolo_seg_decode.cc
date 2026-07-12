@@ -10,7 +10,8 @@
 #include <utility>
 #include <vector>
 
-#include "mw/infer/runtime/postprocess/nms.h"
+#include "mw/infer/runtime/execution_stream.h"
+#include "nms_internal.h"
 #include "yolo_seg_decode_internal.h"
 
 namespace mw::infer {
@@ -125,6 +126,20 @@ void ValidateTensorInputs(const Tensor& predictions, const Tensor& prototypes,
       prototypes.shape()[3] <= 0) {
     throw std::invalid_argument(
         "YOLO segmentation prototype dimensions must be positive");
+  }
+}
+
+void ValidateExecutionStream(const Tensor& predictions,
+                             const ExecutionStream* execution_stream) {
+  if (execution_stream == nullptr) {
+    return;
+  }
+  const Device stream_device = execution_stream->device();
+  if (stream_device.type != predictions.device().type ||
+      stream_device.id != predictions.device().id) {
+    throw std::invalid_argument(
+        "YOLO segmentation execution stream device does not match tensor "
+        "device");
   }
 }
 
@@ -278,15 +293,10 @@ TensorDesc MakeMaskDesc(std::vector<int64_t> shape, Device device) {
 }
 
 YoloSegCandidates AllocateCandidates(int64_t count, Device device,
-                                     bool allocate_nms_boxes,
                                      TensorAllocator& allocator) {
   YoloSegCandidates result;
   result.boxes = Tensor::Allocate(
       MakeFloatDesc("yolo_seg_boxes", {count, 4}, device), allocator);
-  if (allocate_nms_boxes) {
-    result.nms_boxes = Tensor::Allocate(
-        MakeFloatDesc("yolo_seg_nms_boxes", {count, 4}, device), allocator);
-  }
   result.scores = Tensor::Allocate(
       MakeFloatDesc("yolo_seg_scores", {count}, device), allocator);
   result.class_ids = Tensor::Allocate(
@@ -296,44 +306,6 @@ YoloSegCandidates AllocateCandidates(int64_t count, Device device,
   result.candidate_ids = Tensor::Allocate(
       MakeInt64Desc("yolo_seg_candidate_ids", {count}, device), allocator);
   return result;
-}
-
-std::vector<float> MakeGroupedNmsBoxes(const std::vector<float>& boxes,
-                                       const std::vector<int64_t>& class_ids,
-                                       const std::vector<int64_t>& batch_ids,
-                                       int64_t class_count) {
-  if (boxes.empty()) {
-    return {};
-  }
-  const auto coordinate_range = std::minmax_element(boxes.begin(), boxes.end());
-  float coordinate_span = *coordinate_range.second - *coordinate_range.first;
-  if (!std::isfinite(coordinate_span)) {
-    throw std::invalid_argument(
-        "YOLO segmentation box coordinate span is not finite");
-  }
-  coordinate_span = std::nextafter(std::max(coordinate_span, 1.0F),
-                                   std::numeric_limits<float>::infinity());
-
-  std::vector<float> nms_boxes(boxes.size());
-  for (std::size_t index = 0; index < class_ids.size(); ++index) {
-    const double group =
-        static_cast<double>(batch_ids[index]) * class_count + class_ids[index];
-    const double shift = group * coordinate_span;
-    if (!std::isfinite(shift) || shift > std::numeric_limits<float>::max()) {
-      throw std::invalid_argument(
-          "YOLO segmentation NMS group offset exceeds float range");
-    }
-    for (std::size_t coordinate = 0; coordinate < 4; ++coordinate) {
-      const double shifted = boxes[index * 4 + coordinate] + shift;
-      if (!std::isfinite(shifted) ||
-          std::abs(shifted) > std::numeric_limits<float>::max()) {
-        throw std::invalid_argument(
-            "YOLO segmentation shifted box exceeds float range");
-      }
-      nms_boxes[index * 4 + coordinate] = static_cast<float>(shifted);
-    }
-  }
-  return nms_boxes;
 }
 
 YoloSegCandidates RunRawDecodeOnHost(const Tensor& predictions,
@@ -397,15 +369,11 @@ YoloSegCandidates RunRawDecodeOnHost(const Tensor& predictions,
     }
   }
 
-  const std::vector<float> nms_boxes =
-      MakeGroupedNmsBoxes(boxes, class_ids, batch_ids, shape.class_count);
   const int64_t count = static_cast<int64_t>(scores.size());
   YoloSegCandidates result =
-      AllocateCandidates(count, predictions.device(), true, allocator);
+      AllocateCandidates(count, predictions.device(), allocator);
   if (count > 0) {
     std::memcpy(result.boxes.data(), boxes.data(), result.boxes.bytes());
-    std::memcpy(result.nms_boxes.data(), nms_boxes.data(),
-                result.nms_boxes.bytes());
     std::memcpy(result.scores.data(), scores.data(), result.scores.bytes());
     std::memcpy(result.class_ids.data(), class_ids.data(),
                 result.class_ids.bytes());
@@ -459,7 +427,7 @@ YoloSegCandidates RunSelectedDecodeOnHost(const Tensor& predictions,
 
   const int64_t count = static_cast<int64_t>(scores.size());
   YoloSegCandidates result =
-      AllocateCandidates(count, predictions.device(), false, allocator);
+      AllocateCandidates(count, predictions.device(), allocator);
   if (count > 0) {
     std::memcpy(result.boxes.data(), boxes.data(), result.boxes.bytes());
     std::memcpy(result.scores.data(), scores.data(), result.scores.bytes());
@@ -492,35 +460,6 @@ Tensor MakeIndexTensor(const std::vector<int64_t>& indices, Device device,
     std::memcpy(host.data(), indices.data(), host.bytes());
   }
   return host.CopyTo(device, allocator);
-}
-
-Tensor LimitIndicesPerBatch(const Tensor& indices, const Tensor& batch_ids,
-                            int64_t batch_count, int64_t max_detections,
-                            TensorAllocator& allocator) {
-  if (max_detections == 0) {
-    return indices;
-  }
-  const std::vector<int64_t> host_indices = indices.CopyToHostVector<int64_t>();
-  const std::vector<int64_t> host_batch_ids =
-      batch_ids.CopyToHostVector<int64_t>();
-  std::vector<int64_t> counts(static_cast<std::size_t>(batch_count), 0);
-  std::vector<int64_t> limited;
-  limited.reserve(host_indices.size());
-  for (int64_t index : host_indices) {
-    if (index < 0 || index >= static_cast<int64_t>(host_batch_ids.size())) {
-      throw std::runtime_error("YOLO segmentation index is out of range");
-    }
-    const int64_t batch = host_batch_ids[static_cast<std::size_t>(index)];
-    if (batch < 0 || batch >= batch_count) {
-      throw std::runtime_error("YOLO segmentation batch id is out of range");
-    }
-    int64_t& count = counts[static_cast<std::size_t>(batch)];
-    if (count < max_detections) {
-      limited.push_back(index);
-      ++count;
-    }
-  }
-  return MakeIndexTensor(limited, indices.device(), allocator);
 }
 
 Tensor MakeSelectedIndices(const YoloSegCandidates& candidates,
@@ -699,9 +638,11 @@ YoloSegDecodeResult YoloSegDecode(const Tensor& predictions,
                                   const Tensor& prototypes,
                                   ImageSize input_size,
                                   YoloSegDecodeOptions options,
-                                  TensorAllocator& allocator) {
+                                  TensorAllocator& allocator,
+                                  ExecutionStream* execution_stream) {
   ValidateOptions(options);
   ValidateTensorInputs(predictions, prototypes, input_size);
+  ValidateExecutionStream(predictions, execution_stream);
   const PredictionShape shape =
       ResolvePredictionShape(predictions, prototypes, options);
 
@@ -713,15 +654,16 @@ YoloSegDecodeResult YoloSegDecode(const Tensor& predictions,
             : RunSelectedDecodeOnHost(predictions, shape, options, allocator);
   } else if (predictions.device().type == DeviceType::kCuda) {
 #if defined(MW_INFER_HAS_CUDA_POSTPROCESS)
-    candidates = options.prediction_layout == YoloSegPredictionLayout::kRaw
-                     ? postprocess_internal::RunRawYoloSegDecodeOnDevice(
-                           predictions, shape.batch_count, shape.channel_count,
-                           shape.candidate_count, shape.channel_first,
-                           shape.class_count, options, allocator)
-                     : postprocess_internal::RunSelectedYoloSegDecodeOnDevice(
-                           predictions, shape.batch_count, shape.channel_count,
-                           shape.candidate_count, shape.channel_first, options,
-                           allocator);
+    candidates =
+        options.prediction_layout == YoloSegPredictionLayout::kRaw
+            ? postprocess_internal::RunRawYoloSegDecodeOnDevice(
+                  predictions, shape.batch_count, shape.channel_count,
+                  shape.candidate_count, shape.channel_first, shape.class_count,
+                  options, allocator, execution_stream)
+            : postprocess_internal::RunSelectedYoloSegDecodeOnDevice(
+                  predictions, shape.batch_count, shape.channel_count,
+                  shape.candidate_count, shape.channel_first, options,
+                  allocator, execution_stream);
 #else
     throw std::runtime_error(
         "CUDA YOLO segmentation decode is unavailable in this build");
@@ -733,20 +675,24 @@ YoloSegDecodeResult YoloSegDecode(const Tensor& predictions,
 
   Tensor keep;
   if (options.prediction_layout == YoloSegPredictionLayout::kRaw) {
-    keep = Nms(candidates.nms_boxes, candidates.scores, options.iou_threshold,
-               0.0F, 0, allocator);
-    keep = LimitIndicesPerBatch(keep, candidates.batch_ids, shape.batch_count,
-                                options.max_detections, allocator);
+    keep = postprocess_internal::RunClassAwareBatchNms(
+        candidates.boxes, candidates.scores, candidates.class_ids,
+        candidates.batch_ids, options.iou_threshold, 0.0F,
+        options.max_detections, allocator, execution_stream);
   } else {
     keep = MakeSelectedIndices(candidates, shape.batch_count,
                                options.max_detections, allocator);
   }
 
-  Tensor boxes = candidates.boxes.GatherRows(keep, allocator);
-  Tensor scores = candidates.scores.GatherRows(keep, allocator);
-  Tensor class_ids = candidates.class_ids.GatherRows(keep, allocator);
-  Tensor batch_ids = candidates.batch_ids.GatherRows(keep, allocator);
-  Tensor candidate_ids = candidates.candidate_ids.GatherRows(keep, allocator);
+  Tensor boxes = candidates.boxes.GatherRows(keep, allocator, execution_stream);
+  Tensor scores =
+      candidates.scores.GatherRows(keep, allocator, execution_stream);
+  Tensor class_ids =
+      candidates.class_ids.GatherRows(keep, allocator, execution_stream);
+  Tensor batch_ids =
+      candidates.batch_ids.GatherRows(keep, allocator, execution_stream);
+  Tensor candidate_ids =
+      candidates.candidate_ids.GatherRows(keep, allocator, execution_stream);
   Tensor masks;
   const bool scale_coefficients_by_objectness =
       options.prediction_layout == YoloSegPredictionLayout::kRaw &&
@@ -762,7 +708,7 @@ YoloSegDecodeResult YoloSegDecode(const Tensor& predictions,
         predictions, prototypes, boxes, batch_ids, candidate_ids,
         shape.channel_count, shape.candidate_count, shape.channel_first,
         shape.coefficient_start, scale_coefficients_by_objectness, input_size,
-        options.mask_threshold, allocator);
+        options.mask_threshold, allocator, execution_stream);
 #else
     throw std::runtime_error(
         "CUDA YOLO segmentation masks are unavailable in this build");

@@ -1,14 +1,18 @@
 #include <cuda_runtime_api.h>
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 #include <vector>
 
 #include "mw/infer/runtime/input/opencv_cuda_input.h"
 #include "mw/infer/runtime/input/opencv_input.h"
 #include "mw/infer/runtime/process/image_to_tensor.h"
+#include "mw/infer/runtime/process/normalize.h"
 
 namespace mw::infer {
 namespace {
@@ -61,6 +65,12 @@ std::vector<float> CopyFloatTensorToHost(const Tensor& tensor) {
   return values;
 }
 
+void CUDART_CB DelayStream(void* user_data) {
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  static_cast<std::atomic<bool>*>(user_data)->store(true,
+                                                    std::memory_order_release);
+}
+
 TEST(OpenCvCudaImageToTensorTest, UploadsBgrHostMatToRgbCudaBchwTensor) {
   if (!HasUsableCudaDevice()) {
     GTEST_SKIP() << "CUDA image-to-tensor is unavailable";
@@ -94,9 +104,12 @@ TEST(OpenCvCudaImageToTensorTest, ConvertsBgrGpuMatToRgbCudaBhwcTensor) {
   cv::cuda::GpuMat gpu_image;
   gpu_image.upload(MakeTestMat());
   RawImageBatch images(std::vector<cv::cuda::GpuMat>{gpu_image});
+  ExecutionStream stream(Device{DeviceType::kCuda, 0});
 
   Tensor tensor = ToTensor(images, Device{DeviceType::kCuda, 0},
-                           MakeInput({1, 1, 2, 3}), TensorLayout::kBhwc);
+                           MakeInput({1, 1, 2, 3}), stream,
+                           TensorLayout::kBhwc);
+  stream.Synchronize();
 
   ASSERT_EQ(tensor.shape(), std::vector<int64_t>({1, 1, 2, 3}));
   ASSERT_EQ(tensor.device().type, DeviceType::kCuda);
@@ -137,6 +150,71 @@ TEST(OpenCvCudaImageToTensorTest, ConvertsBgraGpuMatToRgbaTensor) {
   EXPECT_FLOAT_EQ(values[5], 6.0F);
   EXPECT_FLOAT_EQ(values[6], 5.0F);
   EXPECT_FLOAT_EQ(values[7], 8.0F);
+}
+
+TEST(OpenCvCudaImageToTensorTest,
+     PreservesExternalStreamOrderThroughNormalize) {
+  if (!HasUsableCudaDevice()) {
+    GTEST_SKIP() << "CUDA image-to-tensor is unavailable";
+  }
+  ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+
+  cv::cuda::GpuMat gpu_image(1, 2, CV_8UC3);
+  gpu_image.setTo(cv::Scalar::all(0));
+  RawImageBatch images(std::vector<cv::cuda::GpuMat>{gpu_image});
+  ExecutionStream stream(Device{DeviceType::kCuda, 0});
+  PooledTensorAllocator allocator;
+  {
+    Tensor warm_converted = ToTensor(images, Device{DeviceType::kCuda, 0},
+                                     MakeInput({1, 3, 1, 2}), stream,
+                                     TensorLayout::kBchw, allocator);
+    Tensor warm_normalized = Normalize(
+        warm_converted, {0.0F, 0.0F, 0.0F}, {1.0F, 1.0F, 1.0F}, stream, 1.0F,
+        TensorLayout::kBchw, allocator);
+    stream.Synchronize();
+  }
+
+  void* source_data = gpu_image.data;
+  const std::size_t source_step = gpu_image.step;
+  const int source_rows = gpu_image.rows;
+  const int source_cols = gpu_image.cols;
+  RawImageBatch pending_images = std::move(images);
+  gpu_image.release();
+  std::atomic<bool> delay_completed{false};
+  ASSERT_EQ(cudaLaunchHostFunc(stream.cuda_handle(), DelayStream,
+                               &delay_completed),
+            cudaSuccess);
+  ASSERT_EQ(cudaMemset2DAsync(source_data, source_step, 7,
+                              static_cast<std::size_t>(source_cols) * 3,
+                              source_rows, stream.cuda_handle()),
+            cudaSuccess);
+
+  Tensor converted = ToTensor(pending_images, Device{DeviceType::kCuda, 0},
+                              MakeInput({1, 3, 1, 2}), stream,
+                              TensorLayout::kBchw, allocator);
+  pending_images = RawImageBatch();
+  Tensor normalized = Normalize(converted, {0.0F, 0.0F, 0.0F},
+                                {1.0F, 1.0F, 1.0F}, stream, 1.0F,
+                                TensorLayout::kBchw, allocator);
+  EXPECT_FALSE(delay_completed.load(std::memory_order_acquire));
+  stream.Synchronize();
+
+  EXPECT_TRUE(delay_completed.load(std::memory_order_acquire));
+  EXPECT_EQ(CopyFloatTensorToHost(normalized),
+            std::vector<float>({7.0F, 7.0F, 7.0F, 7.0F, 7.0F, 7.0F}));
+}
+
+TEST(OpenCvCudaImageToTensorTest, RejectsUnsupportedFloat16Target) {
+  RawImageBatch images(std::vector<cv::Mat>{MakeTestMat()});
+  ImageToTensorConverter converter;
+  const TensorInfo input =
+      MakeInput({1, 3, 1, 2}, DataType::kFloat16);
+
+  EXPECT_FALSE(
+      converter.Supports(images, Device{DeviceType::kCuda, 0}, input));
+  EXPECT_THROW(static_cast<void>(
+                   ToTensor(images, Device{DeviceType::kCuda, 0}, input)),
+               std::invalid_argument);
 }
 
 TEST(OpenCvCudaImageToTensorTest, RejectsGpuMatOnDifferentDevice) {

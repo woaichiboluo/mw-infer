@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "mw/infer/runtime/execution_stream.h"
 #include "mw/infer/runtime/input/input.h"
 
 namespace mw::infer {
@@ -124,8 +125,14 @@ class GeometryResult {
   ImageSize transformed_size(std::size_t index) const;
 
  private:
+  friend class GeometryTransformer;
+
+  GeometryResult(RawImageBatch images, std::vector<GeometryTrace> traces,
+                 std::vector<RawImage> keep_alive);
+
   RawImageBatch images_;
   std::vector<GeometryTrace> traces_;
+  std::vector<RawImage> keep_alive_;
 };
 
 class GeometryAdapter {
@@ -134,10 +141,27 @@ class GeometryAdapter {
 
   virtual bool Supports(const RawImage& image) const = 0;
   virtual RawImage Resize(const RawImage& image, ImageSize size,
-                          Interpolation interpolation) const = 0;
+                           Interpolation interpolation) const = 0;
+  virtual RawImage Resize(const RawImage& image, ImageSize size,
+                          ExecutionStream& stream,
+                          Interpolation interpolation) const {
+    static_cast<void>(stream);
+    return Resize(image, size, interpolation);
+  }
   virtual RawImage Pad(const RawImage& image, Padding padding,
-                       const FillValue& value) const = 0;
+                        const FillValue& value) const = 0;
+  virtual RawImage Pad(const RawImage& image, Padding padding,
+                       ExecutionStream& stream,
+                       const FillValue& value) const {
+    static_cast<void>(stream);
+    return Pad(image, padding, value);
+  }
   virtual RawImage Crop(const RawImage& image, Rect rect) const = 0;
+  virtual RawImage Crop(const RawImage& image, Rect rect,
+                        ExecutionStream& stream) const {
+    static_cast<void>(stream);
+    return Crop(image, rect);
+  }
 };
 
 class GeometryTransformer {
@@ -150,11 +174,19 @@ class GeometryTransformer {
 
   bool Supports(const RawImage& image) const;
 
+  // CUDA work is enqueued on stream. Keep the returned result alive until the
+  // stream is synchronized. CPU adapters remain synchronous by default.
   GeometryResult Resize(
       GeometryResult result, ImageSize size,
       Interpolation interpolation = Interpolation::kLinear) const;
   GeometryResult Resize(
       RawImageBatch images, ImageSize size,
+      Interpolation interpolation = Interpolation::kLinear) const;
+  GeometryResult Resize(
+      GeometryResult result, ImageSize size, ExecutionStream& stream,
+      Interpolation interpolation = Interpolation::kLinear) const;
+  GeometryResult Resize(
+      RawImageBatch images, ImageSize size, ExecutionStream& stream,
       Interpolation interpolation = Interpolation::kLinear) const;
   GeometryResult ResizeShortSide(
       GeometryResult result, int short_side,
@@ -162,24 +194,65 @@ class GeometryTransformer {
   GeometryResult ResizeShortSide(
       RawImageBatch images, int short_side,
       Interpolation interpolation = Interpolation::kLinear) const;
+  GeometryResult ResizeShortSide(
+      GeometryResult result, int short_side, ExecutionStream& stream,
+      Interpolation interpolation = Interpolation::kLinear) const;
+  GeometryResult ResizeShortSide(
+      RawImageBatch images, int short_side, ExecutionStream& stream,
+      Interpolation interpolation = Interpolation::kLinear) const;
   GeometryResult Pad(GeometryResult result, Padding padding,
                      FillValue value = {}) const;
   GeometryResult Pad(RawImageBatch images, Padding padding,
-                     FillValue value = {}) const;
+                      FillValue value = {}) const;
+  GeometryResult Pad(GeometryResult result, Padding padding,
+                     ExecutionStream& stream, FillValue value = {}) const;
+  GeometryResult Pad(RawImageBatch images, Padding padding,
+                     ExecutionStream& stream, FillValue value = {}) const;
   GeometryResult Crop(GeometryResult result, Rect rect) const;
   GeometryResult Crop(RawImageBatch images, Rect rect) const;
+  GeometryResult Crop(GeometryResult result, Rect rect,
+                      ExecutionStream& stream) const;
+  GeometryResult Crop(RawImageBatch images, Rect rect,
+                      ExecutionStream& stream) const;
   GeometryResult CenterCrop(GeometryResult result, ImageSize size) const;
   GeometryResult CenterCrop(RawImageBatch images, ImageSize size) const;
+  GeometryResult CenterCrop(GeometryResult result, ImageSize size,
+                            ExecutionStream& stream) const;
+  GeometryResult CenterCrop(RawImageBatch images, ImageSize size,
+                            ExecutionStream& stream) const;
   GeometryResult LetterBox(GeometryResult result, ImageSize size,
                            Interpolation interpolation = Interpolation::kLinear,
                            FillValue value = {}) const;
   GeometryResult LetterBox(RawImageBatch images, ImageSize size,
-                           Interpolation interpolation = Interpolation::kLinear,
-                           FillValue value = {}) const;
+                            Interpolation interpolation = Interpolation::kLinear,
+                            FillValue value = {}) const;
+  GeometryResult LetterBox(
+      GeometryResult result, ImageSize size, ExecutionStream& stream,
+      Interpolation interpolation = Interpolation::kLinear,
+      FillValue value = {}) const;
+  GeometryResult LetterBox(
+      RawImageBatch images, ImageSize size, ExecutionStream& stream,
+      Interpolation interpolation = Interpolation::kLinear,
+      FillValue value = {}) const;
 
  private:
   void AddAdapter(std::unique_ptr<GeometryAdapter> adapter);
   const GeometryAdapter& SelectAdapter(const RawImage& image) const;
+  GeometryResult ResizeImpl(GeometryResult result, ImageSize size,
+                            Interpolation interpolation,
+                            ExecutionStream* stream) const;
+  GeometryResult ResizeShortSideImpl(GeometryResult result, int short_side,
+                                     Interpolation interpolation,
+                                     ExecutionStream* stream) const;
+  GeometryResult PadImpl(GeometryResult result, Padding padding,
+                         FillValue value, ExecutionStream* stream) const;
+  GeometryResult CropImpl(GeometryResult result, Rect rect,
+                          ExecutionStream* stream) const;
+  GeometryResult CenterCropImpl(GeometryResult result, ImageSize size,
+                                ExecutionStream* stream) const;
+  GeometryResult LetterBoxImpl(GeometryResult result, ImageSize size,
+                               Interpolation interpolation, FillValue value,
+                               ExecutionStream* stream) const;
 
   std::vector<std::unique_ptr<GeometryAdapter>> adapters_;
 };

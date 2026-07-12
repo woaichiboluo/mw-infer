@@ -422,6 +422,25 @@ TEST(OnnxGpuBackendTest, RunsWithCudaOutput) {
   EXPECT_NE(outputs[0].data(), nullptr);
 }
 
+TEST(OnnxGpuBackendTest, RunsWithInjectedExecutionStream) {
+  Model model = AddModel();
+  if (!BackendFactory().Supports(model, CudaDevice())) {
+    GTEST_SKIP() << "ONNX Runtime CUDA provider is unavailable";
+  }
+
+  auto stream = std::make_shared<ExecutionStream>(CudaDevice());
+  BackendPtr backend =
+      CreateBackend(std::move(model), CudaDevice(), {}, stream);
+  stream.reset();
+
+  std::vector<float> input = {1.0F, 2.0F, 3.0F};
+  std::vector<Tensor> outputs = backend->Infer({MakeInputTensor(&input)});
+
+  ASSERT_EQ(outputs.size(), 1U);
+  EXPECT_EQ(outputs[0].device().type, DeviceType::kCuda);
+  ExpectFloatValues(outputs[0], {2.0F, 4.0F, 6.0F});
+}
+
 TEST(OnnxGpuBackendTest, BindsMultiInputTensorsByName) {
   Model model = SubModel();
   if (!BackendFactory().Supports(model, CudaDevice())) {

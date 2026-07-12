@@ -1,9 +1,6 @@
 #include <cuda_runtime_api.h>
-#include <thrust/copy.h>
-#include <thrust/device_ptr.h>
-#include <thrust/device_vector.h>
-#include <thrust/extrema.h>
 #include <thrust/scan.h>
+#include <thrust/system/cuda/execution_policy.h>
 
 #include <algorithm>
 #include <cfloat>
@@ -16,6 +13,7 @@
 #include <utility>
 #include <vector>
 
+#include "mw/infer/runtime/execution_stream.h"
 #include "yolo_seg_decode_internal.h"
 
 namespace mw::infer::postprocess_internal {
@@ -32,6 +30,31 @@ void CheckCuda(cudaError_t status, const char* operation) {
     throw std::runtime_error(CudaErrorMessage(status, operation));
   }
 }
+
+template <typename T>
+class DeviceBuffer final {
+ public:
+  explicit DeviceBuffer(std::size_t count) {
+    if (count > 0) {
+      CheckCuda(cudaMalloc(reinterpret_cast<void**>(&data_), count * sizeof(T)),
+                "cudaMalloc");
+    }
+  }
+
+  ~DeviceBuffer() {
+    if (data_ != nullptr) {
+      static_cast<void>(cudaFree(data_));
+    }
+  }
+
+  DeviceBuffer(const DeviceBuffer&) = delete;
+  DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+
+  T* data() { return data_; }
+
+ private:
+  T* data_ = nullptr;
+};
 
 int CheckedInt64ToInt(int64_t value, const char* name) {
   if (value < 0 || value > std::numeric_limits<int>::max()) {
@@ -98,15 +121,10 @@ Tensor ViewTensor(const Tensor& tensor, std::vector<int64_t> shape) {
 }
 
 YoloSegCandidates AllocateCandidates(int64_t count, Device device,
-                                     bool allocate_nms_boxes,
                                      TensorAllocator& allocator) {
   YoloSegCandidates result;
   result.boxes = Tensor::Allocate(
       MakeFloatDesc("yolo_seg_boxes", {count, 4}, device), allocator);
-  if (allocate_nms_boxes) {
-    result.nms_boxes = Tensor::Allocate(
-        MakeFloatDesc("yolo_seg_nms_boxes", {count, 4}, device), allocator);
-  }
   result.scores = Tensor::Allocate(
       MakeFloatDesc("yolo_seg_scores", {count}, device), allocator);
   result.class_ids = Tensor::Allocate(
@@ -249,21 +267,6 @@ __global__ void RawCompactKernel(const float* predictions, bool channel_first,
   candidate_ids[output] = candidate;
 }
 
-__global__ void MakeGroupedNmsBoxesKernel(
-    const float* boxes, const int64_t* class_ids, const int64_t* batch_ids,
-    int class_count, int box_count, float coordinate_span, float* nms_boxes) {
-  const int global = blockIdx.x * blockDim.x + threadIdx.x;
-  if (global >= box_count) {
-    return;
-  }
-  const int64_t group =
-      batch_ids[global] * static_cast<int64_t>(class_count) + class_ids[global];
-  const float shift = static_cast<float>(group) * coordinate_span;
-  for (int coordinate = 0; coordinate < 4; ++coordinate) {
-    nms_boxes[global * 4 + coordinate] = boxes[global * 4 + coordinate] + shift;
-  }
-}
-
 __global__ void SelectedMarkCandidatesKernel(
     const float* predictions, bool channel_first, int batch_count,
     int channel_count, int candidate_count, float score_threshold, int* flags) {
@@ -327,41 +330,21 @@ __global__ void SelectedCompactKernel(const float* predictions,
   candidate_ids[output] = candidate;
 }
 
-int64_t CompactCount(const thrust::device_vector<int>& flags,
-                     const thrust::device_vector<int>& offsets) {
-  if (flags.empty()) {
+int64_t CompactCount(const int* flags, const int* offsets, int count,
+                     cudaStream_t stream) {
+  if (count == 0) {
     return 0;
   }
   int tail_flag = 0;
   int tail_offset = 0;
-  thrust::copy(flags.end() - 1, flags.end(), &tail_flag);
-  thrust::copy(offsets.end() - 1, offsets.end(), &tail_offset);
+  CheckCuda(cudaMemcpyAsync(&tail_flag, flags + count - 1, sizeof(int),
+                            cudaMemcpyDeviceToHost, stream),
+            "cudaMemcpyAsync");
+  CheckCuda(cudaMemcpyAsync(&tail_offset, offsets + count - 1, sizeof(int),
+                            cudaMemcpyDeviceToHost, stream),
+            "cudaMemcpyAsync");
+  CheckCuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
   return static_cast<int64_t>(tail_flag + tail_offset);
-}
-
-struct BoxCoordinateRange {
-  float span = 0.0F;
-  float max_abs = 0.0F;
-};
-
-BoxCoordinateRange GetBoxCoordinateRange(const Tensor& boxes,
-                                         int64_t box_count) {
-  auto begin =
-      thrust::device_pointer_cast(static_cast<const float*>(boxes.data()));
-  const auto range = thrust::minmax_element(begin, begin + box_count * 4);
-  float minimum = 0.0F;
-  float maximum = 0.0F;
-  thrust::copy(range.first, range.first + 1, &minimum);
-  thrust::copy(range.second, range.second + 1, &maximum);
-  float span = maximum - minimum;
-  if (!std::isfinite(span)) {
-    throw std::invalid_argument(
-        "YOLO segmentation box coordinate span is not finite");
-  }
-  span = std::nextafter(std::max(span, 1.0F),
-                        std::numeric_limits<float>::infinity());
-  return BoxCoordinateRange{span,
-                            std::max(std::abs(minimum), std::abs(maximum))};
 }
 
 __global__ void ComposeCropMaskKernel(
@@ -466,7 +449,8 @@ __global__ void ResizeThresholdMaskKernel(
 YoloSegCandidates RunRawYoloSegDecodeOnDevice(
     const Tensor& predictions, int64_t batch_count, int64_t channel_count,
     int64_t candidate_count, bool channel_first, int64_t class_count,
-    YoloSegDecodeOptions options, TensorAllocator& allocator) {
+    YoloSegDecodeOptions options, TensorAllocator& allocator,
+    ExecutionStream* execution_stream) {
   const int batches =
       CheckedInt64ToInt(batch_count, "YOLO segmentation batch count");
   const int channels =
@@ -478,61 +462,45 @@ YoloSegCandidates RunRawYoloSegDecodeOnDevice(
   const int total_candidates = CheckedProductToInt(
       batches, candidates, "YOLO segmentation candidate total");
   CheckCuda(cudaSetDevice(predictions.device().id), "cudaSetDevice");
+  const cudaStream_t cuda_stream = execution_stream == nullptr
+                                       ? cudaStream_t{}
+                                       : execution_stream->cuda_handle();
 
-  YoloSegCandidates storage = AllocateCandidates(
-      total_candidates, predictions.device(), true, allocator);
+  YoloSegCandidates storage =
+      AllocateCandidates(total_candidates, predictions.device(), allocator);
   if (total_candidates == 0) {
     return storage;
   }
-  thrust::device_vector<int> flags(total_candidates, 0);
-  thrust::device_vector<int> offsets(total_candidates, 0);
+  DeviceBuffer<int> flags(total_candidates);
+  DeviceBuffer<int> offsets(total_candidates);
   const int blocks =
       (total_candidates + kThreadsPerBlock - 1) / kThreadsPerBlock;
   const int class_start = ClassStart(options.version);
   const bool has_objectness = HasObjectness(options.version);
-  RawMarkCandidatesKernel<<<blocks, kThreadsPerBlock>>>(
+  RawMarkCandidatesKernel<<<blocks, kThreadsPerBlock, 0, cuda_stream>>>(
       static_cast<const float*>(predictions.data()), channel_first, batches,
       channels, candidates, class_start, classes, has_objectness,
-      options.score_threshold, thrust::raw_pointer_cast(flags.data()));
+      options.score_threshold, flags.data());
   CheckCuda(cudaGetLastError(), "RawMarkCandidatesKernel");
-  thrust::exclusive_scan(flags.begin(), flags.end(), offsets.begin());
-  const int64_t output_count = CompactCount(flags, offsets);
+  auto policy = thrust::cuda::par.on(cuda_stream);
+  thrust::exclusive_scan(policy, flags.data(), flags.data() + total_candidates,
+                         offsets.data());
+  const int64_t output_count =
+      CompactCount(flags.data(), offsets.data(), total_candidates, cuda_stream);
   if (output_count > 0) {
-    RawCompactKernel<<<blocks, kThreadsPerBlock>>>(
+    RawCompactKernel<<<blocks, kThreadsPerBlock, 0, cuda_stream>>>(
         static_cast<const float*>(predictions.data()), channel_first, batches,
         channels, candidates, class_start, classes, has_objectness,
-        thrust::raw_pointer_cast(flags.data()),
-        thrust::raw_pointer_cast(offsets.data()),
-        static_cast<float*>(storage.boxes.data()),
+        flags.data(), offsets.data(), static_cast<float*>(storage.boxes.data()),
         static_cast<float*>(storage.scores.data()),
         static_cast<int64_t*>(storage.class_ids.data()),
         static_cast<int64_t*>(storage.batch_ids.data()),
         static_cast<int64_t*>(storage.candidate_ids.data()));
     CheckCuda(cudaGetLastError(), "RawCompactKernel");
-
-    const BoxCoordinateRange coordinate_range =
-        GetBoxCoordinateRange(storage.boxes, output_count);
-    const double max_group = static_cast<double>(batches) * classes - 1.0;
-    const double max_shift = max_group * coordinate_range.span;
-    if (!std::isfinite(max_shift) || max_shift + coordinate_range.max_abs >
-                                         std::numeric_limits<float>::max()) {
-      throw std::invalid_argument(
-          "YOLO segmentation NMS group offset exceeds float range");
-    }
-    const int output_blocks =
-        (static_cast<int>(output_count) + kThreadsPerBlock - 1) /
-        kThreadsPerBlock;
-    MakeGroupedNmsBoxesKernel<<<output_blocks, kThreadsPerBlock>>>(
-        static_cast<const float*>(storage.boxes.data()),
-        static_cast<const int64_t*>(storage.class_ids.data()),
-        static_cast<const int64_t*>(storage.batch_ids.data()), classes,
-        static_cast<int>(output_count), coordinate_range.span,
-        static_cast<float*>(storage.nms_boxes.data()));
-    CheckCuda(cudaGetLastError(), "MakeGroupedNmsBoxesKernel");
+    CheckCuda(cudaStreamSynchronize(cuda_stream), "cudaStreamSynchronize");
   }
   return YoloSegCandidates{
       ViewTensor(storage.boxes, {output_count, 4}),
-      ViewTensor(storage.nms_boxes, {output_count, 4}),
       ViewTensor(storage.scores, {output_count}),
       ViewTensor(storage.class_ids, {output_count}),
       ViewTensor(storage.batch_ids, {output_count}),
@@ -543,7 +511,7 @@ YoloSegCandidates RunRawYoloSegDecodeOnDevice(
 YoloSegCandidates RunSelectedYoloSegDecodeOnDevice(
     const Tensor& predictions, int64_t batch_count, int64_t channel_count,
     int64_t candidate_count, bool channel_first, YoloSegDecodeOptions options,
-    TensorAllocator& allocator) {
+    TensorAllocator& allocator, ExecutionStream* execution_stream) {
   const int batches =
       CheckedInt64ToInt(batch_count, "YOLO segmentation batch count");
   const int channels =
@@ -553,38 +521,42 @@ YoloSegCandidates RunSelectedYoloSegDecodeOnDevice(
   const int total_candidates = CheckedProductToInt(
       batches, candidates, "YOLO segmentation candidate total");
   CheckCuda(cudaSetDevice(predictions.device().id), "cudaSetDevice");
+  const cudaStream_t cuda_stream = execution_stream == nullptr
+                                       ? cudaStream_t{}
+                                       : execution_stream->cuda_handle();
 
-  YoloSegCandidates storage = AllocateCandidates(
-      total_candidates, predictions.device(), false, allocator);
+  YoloSegCandidates storage =
+      AllocateCandidates(total_candidates, predictions.device(), allocator);
   if (total_candidates == 0) {
     return storage;
   }
-  thrust::device_vector<int> flags(total_candidates, 0);
-  thrust::device_vector<int> offsets(total_candidates, 0);
+  DeviceBuffer<int> flags(total_candidates);
+  DeviceBuffer<int> offsets(total_candidates);
   const int blocks =
       (total_candidates + kThreadsPerBlock - 1) / kThreadsPerBlock;
-  SelectedMarkCandidatesKernel<<<blocks, kThreadsPerBlock>>>(
+  SelectedMarkCandidatesKernel<<<blocks, kThreadsPerBlock, 0, cuda_stream>>>(
       static_cast<const float*>(predictions.data()), channel_first, batches,
-      channels, candidates, options.score_threshold,
-      thrust::raw_pointer_cast(flags.data()));
+      channels, candidates, options.score_threshold, flags.data());
   CheckCuda(cudaGetLastError(), "SelectedMarkCandidatesKernel");
-  thrust::exclusive_scan(flags.begin(), flags.end(), offsets.begin());
-  const int64_t output_count = CompactCount(flags, offsets);
+  auto policy = thrust::cuda::par.on(cuda_stream);
+  thrust::exclusive_scan(policy, flags.data(), flags.data() + total_candidates,
+                         offsets.data());
+  const int64_t output_count =
+      CompactCount(flags.data(), offsets.data(), total_candidates, cuda_stream);
   if (output_count > 0) {
-    SelectedCompactKernel<<<blocks, kThreadsPerBlock>>>(
+    SelectedCompactKernel<<<blocks, kThreadsPerBlock, 0, cuda_stream>>>(
         static_cast<const float*>(predictions.data()), channel_first, batches,
-        channels, candidates, thrust::raw_pointer_cast(flags.data()),
-        thrust::raw_pointer_cast(offsets.data()),
+        channels, candidates, flags.data(), offsets.data(),
         static_cast<float*>(storage.boxes.data()),
         static_cast<float*>(storage.scores.data()),
         static_cast<int64_t*>(storage.class_ids.data()),
         static_cast<int64_t*>(storage.batch_ids.data()),
         static_cast<int64_t*>(storage.candidate_ids.data()));
     CheckCuda(cudaGetLastError(), "SelectedCompactKernel");
+    CheckCuda(cudaStreamSynchronize(cuda_stream), "cudaStreamSynchronize");
   }
   return YoloSegCandidates{
       ViewTensor(storage.boxes, {output_count, 4}),
-      Tensor{},
       ViewTensor(storage.scores, {output_count}),
       ViewTensor(storage.class_ids, {output_count}),
       ViewTensor(storage.batch_ids, {output_count}),
@@ -597,7 +569,8 @@ Tensor RunYoloSegMasksOnDevice(
     const Tensor& batch_ids, const Tensor& candidate_ids, int64_t channel_count,
     int64_t candidate_count, bool channel_first, int64_t coefficient_start,
     bool scale_coefficients_by_objectness, ImageSize input_size,
-    float mask_threshold, TensorAllocator& allocator) {
+    float mask_threshold, TensorAllocator& allocator,
+    ExecutionStream* execution_stream) {
   const int selected =
       CheckedInt64ToInt(boxes.shape()[0], "YOLO segmentation selected count");
   Tensor output = Tensor::Allocate(
@@ -630,6 +603,9 @@ Tensor RunYoloSegMasksOnDevice(
   const bool output_probabilities = mask_threshold != 0.5F;
   const float value_threshold = output_probabilities ? mask_threshold : 0.0F;
   CheckCuda(cudaSetDevice(predictions.device().id), "cudaSetDevice");
+  const cudaStream_t cuda_stream = execution_stream == nullptr
+                                       ? cudaStream_t{}
+                                       : execution_stream->cuda_handle();
 
   Tensor mask_values = Tensor::Allocate(
       MakeFloatDesc("yolo_seg_mask_values",
@@ -638,7 +614,7 @@ Tensor RunYoloSegMasksOnDevice(
       allocator);
   const int value_blocks =
       (value_count + kThreadsPerBlock - 1) / kThreadsPerBlock;
-  ComposeCropMaskKernel<<<value_blocks, kThreadsPerBlock>>>(
+  ComposeCropMaskKernel<<<value_blocks, kThreadsPerBlock, 0, cuda_stream>>>(
       static_cast<const float*>(predictions.data()),
       static_cast<const float*>(prototypes.data()),
       static_cast<const float*>(boxes.data()),
@@ -652,13 +628,14 @@ Tensor RunYoloSegMasksOnDevice(
 
   const int output_blocks =
       (output_count + kThreadsPerBlock - 1) / kThreadsPerBlock;
-  ResizeThresholdMaskKernel<<<output_blocks, kThreadsPerBlock>>>(
+  ResizeThresholdMaskKernel<<<output_blocks, kThreadsPerBlock, 0,
+                              cuda_stream>>>(
       static_cast<const float*>(mask_values.data()),
       static_cast<const float*>(boxes.data()), selected, prototype_height,
       prototype_width, input_size.height, input_size.width, value_threshold,
       static_cast<std::uint8_t*>(output.data()));
   CheckCuda(cudaGetLastError(), "ResizeThresholdMaskKernel");
-  CheckCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
+  CheckCuda(cudaStreamSynchronize(cuda_stream), "cudaStreamSynchronize");
   return output;
 }
 

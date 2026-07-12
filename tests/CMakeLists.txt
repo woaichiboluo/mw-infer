@@ -62,6 +62,8 @@ mw_infer_add_gtest(mw_infer_model_test runtime/backend/model_test.cpp
                    runtime_backend)
 mw_infer_add_gtest(mw_infer_input_test runtime/input/input_test.cpp
                    runtime_input)
+mw_infer_add_gtest(mw_infer_pipeline_test runtime/pipeline/pipeline_test.cpp
+                   runtime_pipeline)
 mw_infer_add_gtest(mw_infer_tensor_test runtime/tensor/tensor_test.cpp
                    runtime_tensor)
 mw_infer_add_gtest(mw_infer_gather_test runtime/tensor/gather_test.cpp

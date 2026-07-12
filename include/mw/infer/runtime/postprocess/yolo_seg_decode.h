@@ -50,10 +50,14 @@ struct YoloSegDecodeResult {
   Tensor masks;  // [K, input_height, input_width], uint8 values 0 or 1.
 };
 
+// Without an execution stream, CUDA inputs must be ready before this call. A
+// provided stream orders decode after work already queued on that stream. The
+// function synchronizes before returning, so results are ready on any stream.
 YoloSegDecodeResult YoloSegDecode(
     const Tensor& predictions, const Tensor& prototypes, ImageSize input_size,
     YoloSegDecodeOptions options = {},
-    TensorAllocator& allocator = TensorAllocator::Default());
+    TensorAllocator& allocator = TensorAllocator::Default(),
+    ExecutionStream* execution_stream = nullptr);
 
 }  // namespace mw::infer
 

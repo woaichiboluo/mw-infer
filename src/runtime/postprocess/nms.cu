@@ -1,17 +1,20 @@
 #include <cuda_runtime_api.h>
-#include <thrust/copy.h>
-#include <thrust/device_vector.h>
 #include <thrust/sequence.h>
 #include <thrust/sort.h>
+#include <thrust/system/cuda/execution_policy.h>
 
 #include <algorithm>
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include "mw/infer/runtime/execution_stream.h"
 #include "nms_internal.h"
 
 namespace mw::infer::postprocess_internal {
@@ -35,6 +38,61 @@ int CheckedBoxCount(const Tensor& boxes) {
   }
   return static_cast<int>(boxes.shape()[0]);
 }
+
+template <typename T>
+class DeviceBuffer final {
+ public:
+  explicit DeviceBuffer(std::size_t count) {
+    if (count > 0) {
+      if (count > std::numeric_limits<std::size_t>::max() / sizeof(T)) {
+        throw std::invalid_argument("CUDA NMS buffer size overflows size_t");
+      }
+      CheckCuda(cudaMalloc(reinterpret_cast<void**>(&data_), count * sizeof(T)),
+                "cudaMalloc");
+    }
+  }
+
+  ~DeviceBuffer() {
+    if (data_ != nullptr) {
+      static_cast<void>(cudaFree(data_));
+    }
+  }
+
+  DeviceBuffer(const DeviceBuffer&) = delete;
+  DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+
+  T* data() { return data_; }
+
+ private:
+  T* data_ = nullptr;
+};
+
+template <typename T>
+class PinnedBuffer final {
+ public:
+  explicit PinnedBuffer(std::size_t count) {
+    if (count > 0) {
+      CheckCuda(cudaMallocHost(reinterpret_cast<void**>(&data_),
+                               count * sizeof(T)),
+                "cudaMallocHost");
+    }
+  }
+
+  ~PinnedBuffer() {
+    if (data_ != nullptr) {
+      static_cast<void>(cudaFreeHost(data_));
+    }
+  }
+
+  PinnedBuffer(const PinnedBuffer&) = delete;
+  PinnedBuffer& operator=(const PinnedBuffer&) = delete;
+
+  T* data() { return data_; }
+  const T* data() const { return data_; }
+
+ private:
+  T* data_ = nullptr;
+};
 
 __device__ float DeviceMax(float lhs, float rhs) {
   return lhs > rhs ? lhs : rhs;
@@ -73,9 +131,10 @@ __device__ float DeviceBoxIoU(const float* lhs, const float* rhs,
   return intersection / denominator;
 }
 
-__global__ void GatherSortedBoxesKernel(int count, const int64_t* order,
-                                        const float* boxes,
-                                        float* sorted_boxes) {
+__global__ void GatherSortedInputsKernel(
+    int count, const int64_t* order, const float* boxes,
+    const int64_t* class_ids, const int64_t* batch_ids, float* sorted_boxes,
+    int64_t* sorted_class_ids, int64_t* sorted_batch_ids) {
   const int index = blockIdx.x * blockDim.x + threadIdx.x;
   if (index >= count) {
     return;
@@ -85,11 +144,18 @@ __global__ void GatherSortedBoxesKernel(int count, const int64_t* order,
   for (int coord = 0; coord < 4; ++coord) {
     sorted_boxes[index * 4 + coord] = boxes[source_index * 4 + coord];
   }
+  if (class_ids != nullptr) {
+    sorted_class_ids[index] = class_ids[source_index];
+  }
+  if (batch_ids != nullptr) {
+    sorted_batch_ids[index] = batch_ids[source_index];
+  }
 }
 
 __global__ void NmsMaskKernel(int count, float iou_threshold, float offset,
-                              const float* boxes, unsigned long long* mask,
-                              int column_blocks) {
+                              const float* boxes, const int64_t* class_ids,
+                              const int64_t* batch_ids,
+                              unsigned long long* mask, int column_blocks) {
   const int row_block = blockIdx.y;
   const int column_block = blockIdx.x;
   if (row_block > column_block) {
@@ -121,6 +187,13 @@ __global__ void NmsMaskKernel(int count, float iou_threshold, float offset,
   unsigned long long suppress_mask = 0;
   for (int compare_index = compare_start; compare_index < column_size;
        ++compare_index) {
+    const int candidate_index = column_start + compare_index;
+    if ((batch_ids != nullptr &&
+         batch_ids[current_index] != batch_ids[candidate_index]) ||
+        (class_ids != nullptr &&
+         class_ids[current_index] != class_ids[candidate_index])) {
+      continue;
+    }
     if (DeviceBoxIoU(current_box, column_boxes + compare_index * 4, offset) >
         iou_threshold) {
       suppress_mask |= 1ULL << compare_index;
@@ -130,10 +203,53 @@ __global__ void NmsMaskKernel(int count, float iou_threshold, float offset,
   mask[current_index * column_blocks + column_block] = suppress_mask;
 }
 
+TensorDesc MakeBatchOutputDesc(std::string name, DataType data_type,
+                               std::vector<int64_t> shape, Device device) {
+  TensorDesc desc;
+  desc.info.name = std::move(name);
+  desc.info.data_type = data_type;
+  desc.info.shape = std::move(shape);
+  desc.device = device;
+  return desc;
+}
+
+BatchNmsResult AllocateBatchResult(const Tensor& boxes,
+                                   const BatchNmsOptions& options,
+                                   TensorAllocator& allocator) {
+  const int64_t batch_count = boxes.shape()[0];
+  const int64_t max_detections = options.max_detections;
+  const Device device = boxes.device();
+  Tensor counts = Tensor::Allocate(
+      MakeBatchOutputDesc("batch_nms_counts", DataType::kInt64, {batch_count},
+                          device),
+      allocator);
+  Tensor output_boxes = Tensor::Allocate(
+      MakeBatchOutputDesc("batch_nms_boxes", DataType::kFloat32,
+                          {batch_count, max_detections, 4}, device),
+      allocator);
+  Tensor output_scores = Tensor::Allocate(
+      MakeBatchOutputDesc("batch_nms_scores", DataType::kFloat32,
+                          {batch_count, max_detections}, device),
+      allocator);
+  Tensor class_ids = Tensor::Allocate(
+      MakeBatchOutputDesc("batch_nms_class_ids", DataType::kInt64,
+                          {batch_count, max_detections}, device),
+      allocator);
+  Tensor indices = Tensor::Allocate(
+      MakeBatchOutputDesc("batch_nms_indices", DataType::kInt64,
+                          {batch_count, max_detections}, device),
+      allocator);
+  return BatchNmsResult{std::move(counts), std::move(output_boxes),
+                        std::move(output_scores), std::move(class_ids),
+                        std::move(indices)};
+}
+
 }  // namespace
 
 Tensor RunNmsOnDevice(const Tensor& boxes, const Tensor& scores,
-                      NmsParameters parameters, TensorAllocator& allocator) {
+                      const Tensor* class_ids, const Tensor* batch_ids,
+                      NmsParameters parameters, TensorAllocator& allocator,
+                      ExecutionStream* execution_stream) {
   const int count = CheckedBoxCount(boxes);
   if (count == 0) {
     TensorDesc desc;
@@ -145,40 +261,67 @@ Tensor RunNmsOnDevice(const Tensor& boxes, const Tensor& scores,
   }
 
   CheckCuda(cudaSetDevice(boxes.device().id), "cudaSetDevice");
+  const cudaStream_t cuda_stream = execution_stream == nullptr
+                                       ? cudaStream_t{}
+                                       : execution_stream->cuda_handle();
+  auto policy = thrust::cuda::par.on(cuda_stream);
 
   const auto* boxes_data = static_cast<const float*>(boxes.data());
   const auto* scores_data = static_cast<const float*>(scores.data());
 
-  thrust::device_vector<int64_t> order(count);
-  thrust::sequence(order.begin(), order.end(), int64_t{0});
-  thrust::sort(order.begin(), order.end(), ScoreDescending{scores_data});
+  DeviceBuffer<int64_t> order(count);
+  thrust::sequence(policy, order.data(), order.data() + count, int64_t{0});
+  thrust::stable_sort(policy, order.data(), order.data() + count,
+                      ScoreDescending{scores_data});
 
-  thrust::device_vector<float> sorted_boxes(static_cast<std::size_t>(count) *
-                                            4U);
+  DeviceBuffer<float> sorted_boxes(static_cast<std::size_t>(count) * 4U);
+  DeviceBuffer<int64_t> sorted_class_ids(class_ids == nullptr ? 0 : count);
+  DeviceBuffer<int64_t> sorted_batch_ids(batch_ids == nullptr ? 0 : count);
   const int gather_blocks = (count + kThreadsPerBlock - 1) / kThreadsPerBlock;
-  GatherSortedBoxesKernel<<<gather_blocks, kThreadsPerBlock>>>(
-      count, thrust::raw_pointer_cast(order.data()), boxes_data,
-      thrust::raw_pointer_cast(sorted_boxes.data()));
-  CheckCuda(cudaGetLastError(), "GatherSortedBoxesKernel");
+  GatherSortedInputsKernel<<<gather_blocks, kThreadsPerBlock, 0, cuda_stream>>>(
+      count, order.data(), boxes_data,
+      class_ids == nullptr ? nullptr
+                           : static_cast<const int64_t*>(class_ids->data()),
+      batch_ids == nullptr ? nullptr
+                           : static_cast<const int64_t*>(batch_ids->data()),
+      sorted_boxes.data(), sorted_class_ids.data(), sorted_batch_ids.data());
+  CheckCuda(cudaGetLastError(), "GatherSortedInputsKernel");
 
   const int column_blocks = (count + kThreadsPerBlock - 1) / kThreadsPerBlock;
-  thrust::device_vector<unsigned long long> mask(
-      static_cast<std::size_t>(count) * column_blocks, 0);
+  const std::size_t mask_count =
+      static_cast<std::size_t>(count) * column_blocks;
+  DeviceBuffer<unsigned long long> mask(mask_count);
   dim3 mask_blocks(column_blocks, column_blocks);
-  NmsMaskKernel<<<mask_blocks, kThreadsPerBlock>>>(
+  NmsMaskKernel<<<mask_blocks, kThreadsPerBlock, 0, cuda_stream>>>(
       count, parameters.iou_threshold, parameters.coordinate_offset,
-      thrust::raw_pointer_cast(sorted_boxes.data()),
-      thrust::raw_pointer_cast(mask.data()), column_blocks);
+      sorted_boxes.data(), sorted_class_ids.data(), sorted_batch_ids.data(),
+      mask.data(), column_blocks);
   CheckCuda(cudaGetLastError(), "NmsMaskKernel");
 
-  std::vector<unsigned long long> host_mask(mask.size());
-  thrust::copy(mask.begin(), mask.end(), host_mask.begin());
-  std::vector<int64_t> host_order(order.size());
-  thrust::copy(order.begin(), order.end(), host_order.begin());
+  std::vector<unsigned long long> host_mask(mask_count);
+  std::vector<int64_t> host_order(static_cast<std::size_t>(count));
+  std::vector<int64_t> host_batch_ids(
+      batch_ids == nullptr ? 0 : static_cast<std::size_t>(count));
+  CheckCuda(cudaMemcpyAsync(host_mask.data(), mask.data(),
+                            host_mask.size() * sizeof(unsigned long long),
+                            cudaMemcpyDeviceToHost, cuda_stream),
+            "cudaMemcpyAsync");
+  CheckCuda(cudaMemcpyAsync(host_order.data(), order.data(),
+                            host_order.size() * sizeof(int64_t),
+                            cudaMemcpyDeviceToHost, cuda_stream),
+            "cudaMemcpyAsync");
+  if (batch_ids != nullptr) {
+    CheckCuda(cudaMemcpyAsync(host_batch_ids.data(), sorted_batch_ids.data(),
+                              host_batch_ids.size() * sizeof(int64_t),
+                              cudaMemcpyDeviceToHost, cuda_stream),
+              "cudaMemcpyAsync");
+  }
+  CheckCuda(cudaStreamSynchronize(cuda_stream), "cudaStreamSynchronize");
 
   std::vector<unsigned long long> suppressed(column_blocks, 0);
   std::vector<int64_t> keep;
   keep.reserve(static_cast<std::size_t>(count));
+  std::unordered_map<int64_t, int64_t> batch_output_counts;
   for (int sorted_index = 0; sorted_index < count; ++sorted_index) {
     const int block_index = sorted_index / kThreadsPerBlock;
     const int bit_index = sorted_index % kThreadsPerBlock;
@@ -186,8 +329,15 @@ Tensor RunNmsOnDevice(const Tensor& boxes, const Tensor& scores,
       continue;
     }
 
+    if (batch_ids != nullptr && parameters.max_output_boxes > 0 &&
+        batch_output_counts[host_batch_ids[sorted_index]] >=
+            parameters.max_output_boxes) {
+      continue;
+    }
     keep.push_back(host_order[sorted_index]);
-    if (parameters.max_output_boxes > 0 &&
+    if (batch_ids != nullptr) {
+      ++batch_output_counts[host_batch_ids[sorted_index]];
+    } else if (parameters.max_output_boxes > 0 &&
         keep.size() == static_cast<std::size_t>(parameters.max_output_boxes)) {
       break;
     }
@@ -206,11 +356,90 @@ Tensor RunNmsOnDevice(const Tensor& boxes, const Tensor& scores,
   desc.device = boxes.device();
   Tensor output = Tensor::Allocate(std::move(desc), allocator);
   if (output.bytes() > 0) {
-    CheckCuda(cudaMemcpy(output.data(), keep.data(), output.bytes(),
-                         cudaMemcpyHostToDevice),
-              "cudaMemcpy");
+    CheckCuda(cudaMemcpyAsync(output.data(), keep.data(), output.bytes(),
+                              cudaMemcpyHostToDevice, cuda_stream),
+              "cudaMemcpyAsync");
+    CheckCuda(cudaStreamSynchronize(cuda_stream), "cudaStreamSynchronize");
   }
   return output;
+}
+
+BatchNmsResult RunBatchNmsOnDevice(
+    const Tensor& boxes, const Tensor& scores,
+    const BatchNmsOptions& options, TensorAllocator& allocator,
+    ExecutionStream* execution_stream) {
+  CheckCuda(cudaSetDevice(boxes.device().id), "cudaSetDevice");
+  const cudaStream_t cuda_stream = execution_stream == nullptr
+                                       ? cudaStream_t{}
+                                       : execution_stream->cuda_handle();
+  PinnedBuffer<float> host_boxes(boxes.element_count());
+  PinnedBuffer<float> host_scores(scores.element_count());
+
+  try {
+    if (boxes.bytes() > 0) {
+      CheckCuda(cudaMemcpyAsync(host_boxes.data(), boxes.data(), boxes.bytes(),
+                                cudaMemcpyDeviceToHost, cuda_stream),
+                "cudaMemcpyAsync");
+    }
+    if (scores.bytes() > 0) {
+      CheckCuda(cudaMemcpyAsync(host_scores.data(), scores.data(),
+                                scores.bytes(), cudaMemcpyDeviceToHost,
+                                cuda_stream),
+                "cudaMemcpyAsync");
+    }
+    if (boxes.bytes() > 0 || scores.bytes() > 0) {
+      CheckCuda(cudaStreamSynchronize(cuda_stream), "cudaStreamSynchronize");
+    }
+
+    BatchNmsHostResult host_result = RunBatchNmsOnHostBuffers(
+        host_boxes.data(), host_scores.data(), boxes.shape()[0],
+        boxes.shape()[1], scores.shape()[2], options);
+    BatchNmsResult output = AllocateBatchResult(boxes, options, allocator);
+
+    PinnedBuffer<int64_t> output_counts(host_result.counts.size());
+    PinnedBuffer<float> output_boxes(host_result.boxes.size());
+    PinnedBuffer<float> output_scores(host_result.scores.size());
+    PinnedBuffer<int64_t> output_class_ids(host_result.class_ids.size());
+    PinnedBuffer<int64_t> output_indices(host_result.indices.size());
+    std::copy(host_result.counts.begin(), host_result.counts.end(),
+              output_counts.data());
+    std::copy(host_result.boxes.begin(), host_result.boxes.end(),
+              output_boxes.data());
+    std::copy(host_result.scores.begin(), host_result.scores.end(),
+              output_scores.data());
+    std::copy(host_result.class_ids.begin(), host_result.class_ids.end(),
+              output_class_ids.data());
+    std::copy(host_result.indices.begin(), host_result.indices.end(),
+              output_indices.data());
+
+    bool has_output_copy = false;
+    const auto copy_output = [&](void* destination, const void* source,
+                                 std::size_t bytes) {
+      if (bytes == 0) {
+        return;
+      }
+      CheckCuda(cudaMemcpyAsync(destination, source, bytes,
+                                cudaMemcpyHostToDevice, cuda_stream),
+                "cudaMemcpyAsync");
+      has_output_copy = true;
+    };
+    copy_output(output.counts.data(), output_counts.data(),
+                output.counts.bytes());
+    copy_output(output.boxes.data(), output_boxes.data(), output.boxes.bytes());
+    copy_output(output.scores.data(), output_scores.data(),
+                output.scores.bytes());
+    copy_output(output.class_ids.data(), output_class_ids.data(),
+                output.class_ids.bytes());
+    copy_output(output.indices.data(), output_indices.data(),
+                output.indices.bytes());
+    if (has_output_copy) {
+      CheckCuda(cudaStreamSynchronize(cuda_stream), "cudaStreamSynchronize");
+    }
+    return output;
+  } catch (...) {
+    static_cast<void>(cudaStreamSynchronize(cuda_stream));
+    throw;
+  }
 }
 
 }  // namespace mw::infer::postprocess_internal

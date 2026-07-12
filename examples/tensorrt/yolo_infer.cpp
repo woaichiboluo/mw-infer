@@ -221,41 +221,44 @@ std::vector<std::vector<Detection>> DecodeDetections(
     int64_t max_detections) {
   mw::infer::YoloDecodeOptions options;
   options.version = version;
-  options.score_threshold = score_threshold;
   mw::infer::YoloDecodeResult decoded = mw::infer::YoloDecode(output, options);
-  mw::infer::Tensor keep =
-      mw::infer::Nms(decoded.nms_boxes, decoded.scores, iou_threshold);
-  mw::infer::Tensor selected_boxes = decoded.boxes.GatherRows(keep);
-  mw::infer::Tensor selected_scores = decoded.scores.GatherRows(keep);
-  mw::infer::Tensor selected_class_ids = decoded.class_ids.GatherRows(keep);
-  mw::infer::Tensor selected_batch_ids = decoded.batch_ids.GatherRows(keep);
+  mw::infer::BatchNmsOptions nms_options;
+  nms_options.score_threshold = score_threshold;
+  nms_options.iou_threshold = iou_threshold;
+  nms_options.max_detections = max_detections;
+  mw::infer::BatchNmsResult selected =
+      mw::infer::BatchNms(decoded.boxes, decoded.scores, nms_options);
 
-  const std::vector<float> boxes = selected_boxes.CopyToHostVector<float>();
-  const std::vector<float> scores = selected_scores.CopyToHostVector<float>();
+  const std::vector<int64_t> counts =
+      selected.counts.CopyToHostVector<int64_t>();
+  const std::vector<float> boxes = selected.boxes.CopyToHostVector<float>();
+  const std::vector<float> scores = selected.scores.CopyToHostVector<float>();
   const std::vector<int64_t> class_ids =
-      selected_class_ids.CopyToHostVector<int64_t>();
-  const std::vector<int64_t> batch_ids =
-      selected_batch_ids.CopyToHostVector<int64_t>();
+      selected.class_ids.CopyToHostVector<int64_t>();
 
+  if (counts.size() != traces.size() || selected.boxes.shape().size() != 3) {
+    throw std::runtime_error("BatchNms returned an invalid batch shape");
+  }
+  const int64_t output_slots = selected.boxes.shape()[1];
   std::vector<std::vector<Detection>> detections(traces.size());
-  for (std::size_t index = 0; index < scores.size(); ++index) {
-    const int64_t batch_id = batch_ids[index];
-    if (batch_id < 0 || batch_id >= static_cast<int64_t>(detections.size())) {
-      throw std::runtime_error("YOLO decode returned invalid batch id");
+  for (std::size_t batch = 0; batch < traces.size(); ++batch) {
+    const int64_t count = counts[batch];
+    if (count < 0 || count > output_slots) {
+      throw std::runtime_error("BatchNms returned an invalid detection count");
     }
-    std::vector<Detection>& batch_detections =
-        detections[static_cast<std::size_t>(batch_id)];
-    if (batch_detections.size() >= static_cast<std::size_t>(max_detections)) {
-      continue;
+    std::vector<Detection>& batch_detections = detections[batch];
+    batch_detections.reserve(static_cast<std::size_t>(count));
+    for (int64_t detection = 0; detection < count; ++detection) {
+      const std::size_t index = static_cast<std::size_t>(
+          static_cast<int64_t>(batch) * output_slots + detection);
+      const std::size_t box_offset = index * 4;
+      mw::infer::Rect2f box{boxes[box_offset], boxes[box_offset + 1],
+                            boxes[box_offset + 2] - boxes[box_offset],
+                            boxes[box_offset + 3] - boxes[box_offset + 1]};
+      batch_detections.push_back(
+          Detection{static_cast<int>(class_ids[index]), scores[index],
+                    traces[batch].RestoreRect(box)});
     }
-
-    const std::size_t box_offset = index * 4;
-    mw::infer::Rect2f box{boxes[box_offset], boxes[box_offset + 1],
-                          boxes[box_offset + 2] - boxes[box_offset],
-                          boxes[box_offset + 3] - boxes[box_offset + 1]};
-    batch_detections.push_back(
-        Detection{static_cast<int>(class_ids[index]), scores[index],
-                  traces[static_cast<std::size_t>(batch_id)].RestoreRect(box)});
   }
   return detections;
 }

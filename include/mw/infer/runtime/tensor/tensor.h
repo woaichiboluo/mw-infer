@@ -15,6 +15,8 @@
 
 namespace mw::infer {
 
+class ExecutionStream;
+
 enum class DataType {
   kUnknown,
   kUInt8,
@@ -296,9 +298,9 @@ class Tensor {
 
   Tensor CopyTo(Device target_device,
                 TensorAllocator& allocator = TensorAllocator::Default()) const;
-  Tensor GatherRows(
-      const Tensor& indices,
-      TensorAllocator& allocator = TensorAllocator::Default()) const;
+  Tensor GatherRows(const Tensor& indices,
+                    TensorAllocator& allocator = TensorAllocator::Default(),
+                    ExecutionStream* execution_stream = nullptr) const;
   template <typename T>
   std::vector<T> CopyToHostVector(
       TensorAllocator& allocator = TensorAllocator::Default()) const {

@@ -12,7 +12,8 @@ namespace mw::infer {
 namespace process_internal {
 Tensor RunNormalizeOnDevice(const Tensor& input, const std::vector<float>& mean,
                             const std::vector<float>& stddev, float scale,
-                            TensorLayout layout, TensorAllocator& allocator);
+                            TensorLayout layout, ExecutionStream* stream,
+                            TensorAllocator& allocator);
 }  // namespace process_internal
 #endif
 
@@ -119,26 +120,47 @@ Tensor RunNormalizeOnHost(const Tensor& input, const std::vector<float>& mean,
   return output;
 }
 
-}  // namespace
+bool SameDevice(Device lhs, Device rhs) {
+  return lhs.type == rhs.type && lhs.id == rhs.id;
+}
 
-Tensor Normalize(const Tensor& input, const std::vector<float>& mean,
-                 const std::vector<float>& stddev, float scale,
-                 TensorLayout layout, TensorAllocator& allocator) {
+Tensor NormalizeImpl(const Tensor& input, const std::vector<float>& mean,
+                     const std::vector<float>& stddev, float scale,
+                     TensorLayout layout, ExecutionStream* stream,
+                     TensorAllocator& allocator) {
   const ImageTensorShape shape = ValidateImageTensor(input, layout);
   ValidateParameters(mean, stddev, scale, shape.channels);
+  if (stream != nullptr && !SameDevice(input.device(), stream->device())) {
+    throw std::invalid_argument(
+        "Normalize stream device does not match input device");
+  }
   if (input.device().type == DeviceType::kCpu) {
     return RunNormalizeOnHost(input, mean, stddev, scale, shape, layout,
                               allocator);
   }
   if (input.device().type == DeviceType::kCuda) {
 #if defined(MW_INFER_HAS_CUDA_PREPROCESS)
-    return process_internal::RunNormalizeOnDevice(input, mean, stddev, scale,
-                                                  layout, allocator);
+    return process_internal::RunNormalizeOnDevice(
+        input, mean, stddev, scale, layout, stream, allocator);
 #else
     throw std::runtime_error("CUDA preprocess is unavailable in this build");
 #endif
   }
   throw std::invalid_argument("Normalize tensor device is unsupported");
+}
+
+}  // namespace
+
+Tensor Normalize(const Tensor& input, const std::vector<float>& mean,
+                 const std::vector<float>& stddev, float scale,
+                 TensorLayout layout, TensorAllocator& allocator) {
+  return NormalizeImpl(input, mean, stddev, scale, layout, nullptr, allocator);
+}
+
+Tensor Normalize(const Tensor& input, const std::vector<float>& mean,
+                 const std::vector<float>& stddev, ExecutionStream& stream,
+                 float scale, TensorLayout layout, TensorAllocator& allocator) {
+  return NormalizeImpl(input, mean, stddev, scale, layout, &stream, allocator);
 }
 
 }  // namespace mw::infer

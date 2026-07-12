@@ -6,6 +6,8 @@
 
 namespace mw::infer {
 
+class ExecutionStream;
+
 enum class YoloVersion {
   kYoloV5,
   kYoloV8,
@@ -13,23 +15,31 @@ enum class YoloVersion {
   kYoloV26,
 };
 
+enum class YoloTensorLayout {
+  // Uses the official export layout when both candidate axes are plausible:
+  // YOLOv5 is candidate-first, while newer versions are channel-first.
+  kAuto,
+  kChannelFirst,
+  kCandidateFirst,
+};
+
 struct YoloDecodeOptions {
   YoloVersion version = YoloVersion::kYoloV8;
-  float score_threshold = 0.25F;
-  float class_offset = 4096.0F;
+  YoloTensorLayout tensor_layout = YoloTensorLayout::kAuto;
 };
 
 struct YoloDecodeResult {
-  Tensor boxes;
-  Tensor nms_boxes;
-  Tensor scores;
-  Tensor class_ids;
-  Tensor batch_ids;
+  Tensor boxes;   // float32 [B, N, 4], xyxy.
+  Tensor scores;  // float32 [B, N, C].
 };
 
+// A provided CUDA stream orders decode after work already queued on that
+// stream. Keep predictions and the result alive until the stream is
+// synchronized.
 YoloDecodeResult YoloDecode(
     const Tensor& predictions, YoloDecodeOptions options = {},
-    TensorAllocator& allocator = TensorAllocator::Default());
+    TensorAllocator& allocator = TensorAllocator::Default(),
+    ExecutionStream* execution_stream = nullptr);
 
 }  // namespace mw::infer
 

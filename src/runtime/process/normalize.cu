@@ -1,9 +1,12 @@
 #include <cuda_runtime_api.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "mw/infer/runtime/process/normalize.h"
@@ -22,36 +25,6 @@ void CheckCuda(cudaError_t status, const char* operation) {
     throw std::runtime_error(CudaErrorMessage(status, operation));
   }
 }
-
-template <typename T>
-class DeviceBuffer {
- public:
-  explicit DeviceBuffer(std::size_t count) : count_(count) {
-    CheckCuda(cudaMalloc(reinterpret_cast<void**>(&data_), count * sizeof(T)),
-              "cudaMalloc");
-  }
-
-  DeviceBuffer(const DeviceBuffer&) = delete;
-  DeviceBuffer& operator=(const DeviceBuffer&) = delete;
-
-  ~DeviceBuffer() {
-    if (data_ != nullptr) {
-      static_cast<void>(cudaFree(data_));
-    }
-  }
-
-  void CopyFromHost(const T* source) {
-    CheckCuda(
-        cudaMemcpy(data_, source, count_ * sizeof(T), cudaMemcpyHostToDevice),
-        "cudaMemcpy");
-  }
-
-  T* data() { return data_; }
-
- private:
-  T* data_ = nullptr;
-  std::size_t count_ = 0;
-};
 
 struct ImageTensorShape {
   int64_t batch = 0;
@@ -92,6 +65,61 @@ int GridBlocks(std::size_t element_count) {
   return static_cast<int>(blocks);
 }
 
+Tensor AllocateOutputAndParameters(const Tensor& input,
+                                   const std::vector<float>& mean,
+                                   const std::vector<float>& stddev,
+                                   TensorAllocator& allocator,
+                                   float** device_parameters,
+                                   const float** host_parameters) {
+  const std::size_t parameter_count = mean.size() + stddev.size();
+  if (parameter_count >
+      std::numeric_limits<std::size_t>::max() / sizeof(float)) {
+    throw std::invalid_argument("CUDA normalize parameter size overflows");
+  }
+  const std::size_t parameter_bytes = parameter_count * sizeof(float);
+  if (input.bytes() >
+      std::numeric_limits<std::size_t>::max() - parameter_bytes) {
+    throw std::invalid_argument("CUDA preprocess storage size overflows");
+  }
+  const std::size_t storage_bytes = input.bytes() + parameter_bytes;
+  if (storage_bytes >
+      static_cast<std::size_t>(std::numeric_limits<int64_t>::max())) {
+    throw std::invalid_argument("CUDA preprocess storage exceeds int64 range");
+  }
+
+  TensorDesc storage_desc = input.desc();
+  storage_desc.info.data_type = DataType::kUInt8;
+  storage_desc.info.shape = {static_cast<int64_t>(storage_bytes)};
+  struct OutputOwner {
+    Tensor storage;
+    Tensor input;
+    std::vector<float> parameters;
+  };
+  auto owner = std::make_shared<OutputOwner>();
+  owner->storage = Tensor::Allocate(std::move(storage_desc), allocator);
+  owner->input = input;
+  owner->parameters.reserve(parameter_count);
+  owner->parameters.insert(owner->parameters.end(), mean.begin(), mean.end());
+  owner->parameters.insert(owner->parameters.end(), stddev.begin(),
+                           stddev.end());
+  *device_parameters = reinterpret_cast<float*>(
+      static_cast<std::byte*>(owner->storage.data()) + input.bytes());
+  *host_parameters = owner->parameters.data();
+  std::shared_ptr<void> output_owner = owner;
+  return Tensor::FromExternal(MakeOutputDesc(input), owner->storage.data(),
+                              input.bytes(),
+                              std::move(output_owner));
+}
+
+void SynchronizeNoThrow(ExecutionStream* stream,
+                        cudaStream_t cuda_stream) noexcept {
+  if (stream != nullptr) {
+    stream->SynchronizeNoThrow();
+    return;
+  }
+  static_cast<void>(cudaStreamSynchronize(cuda_stream));
+}
+
 __global__ void NormalizeKernel(const float* input, float* output,
                                 const float* mean, const float* stddev,
                                 float scale, int64_t element_count,
@@ -118,23 +146,41 @@ __global__ void NormalizeKernel(const float* input, float* output,
 
 Tensor RunNormalizeOnDevice(const Tensor& input, const std::vector<float>& mean,
                             const std::vector<float>& stddev, float scale,
-                            TensorLayout layout, TensorAllocator& allocator) {
+                            TensorLayout layout, ExecutionStream* stream,
+                            TensorAllocator& allocator) {
   CheckCuda(cudaSetDevice(input.device().id), "cudaSetDevice");
-
-  DeviceBuffer<float> device_mean(mean.size());
-  DeviceBuffer<float> device_stddev(stddev.size());
-  device_mean.CopyFromHost(mean.data());
-  device_stddev.CopyFromHost(stddev.data());
-
-  Tensor output = Tensor::Allocate(MakeOutputDesc(input), allocator);
-  const ImageTensorShape shape = TensorShape(input, layout);
-  const int layout_id = layout == TensorLayout::kBchw ? 0 : 1;
-  NormalizeKernel<<<GridBlocks(input.element_count()), kThreadsPerBlock>>>(
-      static_cast<const float*>(input.data()),
-      static_cast<float*>(output.data()), device_mean.data(),
-      device_stddev.data(), scale, static_cast<int64_t>(input.element_count()),
-      shape.channels, shape.height, shape.width, layout_id);
-  CheckCuda(cudaGetLastError(), "NormalizeKernel");
+  const cudaStream_t cuda_stream =
+      stream == nullptr ? nullptr : stream->cuda_handle();
+  float* device_mean = nullptr;
+  const float* host_parameters = nullptr;
+  Tensor output = AllocateOutputAndParameters(input, mean, stddev, allocator,
+                                               &device_mean, &host_parameters);
+  float* device_stddev = device_mean + mean.size();
+  try {
+    CheckCuda(cudaMemcpyAsync(device_mean, host_parameters,
+                              mean.size() * sizeof(float),
+                              cudaMemcpyHostToDevice, cuda_stream),
+              "cudaMemcpyAsync");
+    CheckCuda(cudaMemcpyAsync(device_stddev, host_parameters + mean.size(),
+                              stddev.size() * sizeof(float),
+                              cudaMemcpyHostToDevice, cuda_stream),
+              "cudaMemcpyAsync");
+    const ImageTensorShape shape = TensorShape(input, layout);
+    const int layout_id = layout == TensorLayout::kBchw ? 0 : 1;
+    NormalizeKernel<<<GridBlocks(input.element_count()), kThreadsPerBlock, 0,
+                      cuda_stream>>>(
+        static_cast<const float*>(input.data()),
+        static_cast<float*>(output.data()), device_mean, device_stddev, scale,
+        static_cast<int64_t>(input.element_count()), shape.channels,
+        shape.height, shape.width, layout_id);
+    CheckCuda(cudaGetLastError(), "NormalizeKernel");
+    if (stream == nullptr) {
+      CheckCuda(cudaStreamSynchronize(cuda_stream), "cudaStreamSynchronize");
+    }
+  } catch (...) {
+    SynchronizeNoThrow(stream, cuda_stream);
+    throw;
+  }
   return output;
 }
 

@@ -1,5 +1,6 @@
 add_library(MwInferRuntime STATIC runtime/backend/backend.cpp
                                  runtime/backend/model.cpp
+                                 runtime/execution_stream.cpp
                                  runtime/tensor/gather.cpp
                                  runtime/tensor/host_tensor_allocator.cpp
                                  runtime/tensor/tensor_allocator.cpp
@@ -140,6 +141,7 @@ if(TARGET CUDA::cudart)
                                 "${MW_INFER_CUDA_ARCHITECTURES}")
     target_sources(MwInferRuntime PRIVATE runtime/tensor/gather.cu
                                           runtime/process/channel.cu
+                                          runtime/process/image_to_tensor.cu
                                           runtime/process/normalize.cu
                                           runtime/postprocess/nms.cu
                                           runtime/postprocess/segmentation.cu

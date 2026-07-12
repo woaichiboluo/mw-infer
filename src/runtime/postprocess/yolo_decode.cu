@@ -1,16 +1,13 @@
 #include <cuda_runtime_api.h>
-#include <thrust/copy.h>
-#include <thrust/device_vector.h>
-#include <thrust/scan.h>
-
-#include <cfloat>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "mw/infer/runtime/execution_stream.h"
 #include "mw/infer/runtime/postprocess/yolo_decode.h"
 
 namespace mw::infer::postprocess_internal {
@@ -18,13 +15,10 @@ namespace {
 
 constexpr int kThreadsPerBlock = 256;
 
-std::string CudaErrorMessage(cudaError_t status, const char* operation) {
-  return std::string(operation) + " failed: " + cudaGetErrorString(status);
-}
-
 void CheckCuda(cudaError_t status, const char* operation) {
   if (status != cudaSuccess) {
-    throw std::runtime_error(CudaErrorMessage(status, operation));
+    throw std::runtime_error(std::string(operation) +
+                             " failed: " + cudaGetErrorString(status));
   }
 }
 
@@ -59,28 +53,35 @@ TensorDesc MakeFloatDesc(std::string name, std::vector<int64_t> shape,
   return desc;
 }
 
-TensorDesc MakeClassIdDesc(std::vector<int64_t> shape, Device device) {
-  TensorDesc desc;
-  desc.info.name = "yolo_class_ids";
-  desc.info.data_type = DataType::kInt64;
-  desc.info.shape = std::move(shape);
-  desc.device = device;
-  return desc;
-}
+struct OutputOwner {
+  Tensor boxes_storage;
+  Tensor scores_storage;
+  Tensor predictions;
+};
 
-TensorDesc MakeBatchIdDesc(std::vector<int64_t> shape, Device device) {
-  TensorDesc desc;
-  desc.info.name = "yolo_batch_ids";
-  desc.info.data_type = DataType::kInt64;
-  desc.info.shape = std::move(shape);
-  desc.device = device;
-  return desc;
-}
-
-Tensor ViewTensor(const Tensor& tensor, std::vector<int64_t> shape) {
-  TensorDesc desc = tensor.desc();
-  desc.info.shape = std::move(shape);
-  return tensor.View(std::move(desc));
+YoloDecodeResult AllocateResult(const Tensor& predictions, int64_t batch_count,
+                                int64_t candidate_count, int64_t class_count,
+                                TensorAllocator& allocator) {
+  const TensorDesc boxes_desc =
+      MakeFloatDesc("yolo_boxes", {batch_count, candidate_count, 4},
+                    predictions.device());
+  const TensorDesc scores_desc =
+      MakeFloatDesc("yolo_scores", {batch_count, candidate_count, class_count},
+                    predictions.device());
+  auto owner = std::make_shared<OutputOwner>();
+  owner->boxes_storage = Tensor::Allocate(boxes_desc, allocator);
+  owner->scores_storage = Tensor::Allocate(scores_desc, allocator);
+  owner->predictions = predictions;
+  std::shared_ptr<void> boxes_owner = owner;
+  std::shared_ptr<void> scores_owner = owner;
+  return YoloDecodeResult{
+      Tensor::FromExternal(boxes_desc, owner->boxes_storage.data(),
+                           owner->boxes_storage.bytes(),
+                           std::move(boxes_owner)),
+      Tensor::FromExternal(scores_desc, owner->scores_storage.data(),
+                           owner->scores_storage.bytes(),
+                           std::move(scores_owner)),
+  };
 }
 
 __device__ float PredictionValue(const float* predictions, bool channel_first,
@@ -94,37 +95,10 @@ __device__ float PredictionValue(const float* predictions, bool channel_first,
                      channel];
 }
 
-__device__ float CandidateScore(const float* predictions, bool channel_first,
-                                int channel_count, int candidate_count,
-                                int class_start, bool has_objectness, int batch,
-                                int candidate, int* best_class) {
-  const int class_count = channel_count - class_start;
-  float best_class_score = -FLT_MAX;
-  int selected_class = 0;
-  for (int class_index = 0; class_index < class_count; ++class_index) {
-    const float class_score = PredictionValue(
-        predictions, channel_first, channel_count, candidate_count, batch,
-        class_start + class_index, candidate);
-    if (class_score > best_class_score) {
-      best_class_score = class_score;
-      selected_class = class_index;
-    }
-  }
-
-  *best_class = selected_class;
-  const float objectness =
-      has_objectness
-          ? PredictionValue(predictions, channel_first, channel_count,
-                            candidate_count, batch, 4, candidate)
-          : 1.0F;
-  return objectness * best_class_score;
-}
-
-__global__ void YoloMarkCandidatesKernel(const float* predictions,
-                                         bool channel_first, int batch_count,
-                                         int channel_count, int candidate_count,
-                                         int class_start, bool has_objectness,
-                                         float score_threshold, int* flags) {
+__global__ void YoloDecodeKernel(
+    const float* predictions, bool channel_first, int batch_count,
+    int channel_count, int candidate_count, int class_start,
+    bool has_objectness, float* boxes, float* scores) {
   const int global = blockIdx.x * blockDim.x + threadIdx.x;
   const int total_candidates = batch_count * candidate_count;
   if (global >= total_candidates) {
@@ -132,45 +106,8 @@ __global__ void YoloMarkCandidatesKernel(const float* predictions,
   }
   const int batch = global / candidate_count;
   const int candidate = global % candidate_count;
+  const int class_count = channel_count - class_start;
 
-  int best_class = 0;
-  const float score = CandidateScore(
-      predictions, channel_first, channel_count, candidate_count, class_start,
-      has_objectness, batch, candidate, &best_class);
-  if (score < score_threshold) {
-    flags[global] = 0;
-    return;
-  }
-
-  const float width = PredictionValue(predictions, channel_first, channel_count,
-                                      candidate_count, batch, 2, candidate);
-  const float height =
-      PredictionValue(predictions, channel_first, channel_count,
-                      candidate_count, batch, 3, candidate);
-  flags[global] = (width > 0.0F && height > 0.0F) ? 1 : 0;
-}
-
-__global__ void YoloCompactKernel(const float* predictions, bool channel_first,
-                                  int batch_count, int channel_count,
-                                  int candidate_count, int class_start,
-                                  bool has_objectness, float class_offset,
-                                  const int* flags, const int* offsets,
-                                  float* boxes, float* nms_boxes, float* scores,
-                                  int64_t* class_ids, int64_t* batch_ids) {
-  const int global = blockIdx.x * blockDim.x + threadIdx.x;
-  const int total_candidates = batch_count * candidate_count;
-  if (global >= total_candidates || flags[global] == 0) {
-    return;
-  }
-  const int batch = global / candidate_count;
-  const int candidate = global % candidate_count;
-
-  int best_class = 0;
-  const float score = CandidateScore(
-      predictions, channel_first, channel_count, candidate_count, class_start,
-      has_objectness, batch, candidate, &best_class);
-
-  const int output = offsets[global];
   const float center_x =
       PredictionValue(predictions, channel_first, channel_count,
                       candidate_count, batch, 0, candidate);
@@ -186,21 +123,35 @@ __global__ void YoloCompactKernel(const float* predictions, bool channel_first,
   const float top = center_y - height * 0.5F;
   const float right = center_x + width * 0.5F;
   const float bottom = center_y + height * 0.5F;
-  const int class_count = channel_count - class_start;
-  const float nms_shift =
-      static_cast<float>(batch * class_count + best_class) * class_offset;
 
-  boxes[output * 4] = left;
-  boxes[output * 4 + 1] = top;
-  boxes[output * 4 + 2] = right;
-  boxes[output * 4 + 3] = bottom;
-  nms_boxes[output * 4] = left + nms_shift;
-  nms_boxes[output * 4 + 1] = top + nms_shift;
-  nms_boxes[output * 4 + 2] = right + nms_shift;
-  nms_boxes[output * 4 + 3] = bottom + nms_shift;
-  scores[output] = score;
-  class_ids[output] = best_class;
-  batch_ids[output] = batch;
+  float* output_box = boxes + static_cast<std::size_t>(global) * 4U;
+  output_box[0] = left;
+  output_box[1] = top;
+  output_box[2] = right;
+  output_box[3] = bottom;
+
+  const float objectness =
+      has_objectness
+          ? PredictionValue(predictions, channel_first, channel_count,
+                            candidate_count, batch, 4, candidate)
+          : 1.0F;
+  float* output_scores =
+      scores + static_cast<std::size_t>(global) * class_count;
+  for (int class_index = 0; class_index < class_count; ++class_index) {
+    const float class_score = PredictionValue(
+        predictions, channel_first, channel_count, candidate_count, batch,
+        class_start + class_index, candidate);
+    output_scores[class_index] = objectness * class_score;
+  }
+}
+
+void SynchronizeNoThrow(ExecutionStream* execution_stream,
+                        cudaStream_t cuda_stream) noexcept {
+  if (execution_stream != nullptr) {
+    execution_stream->SynchronizeNoThrow();
+    return;
+  }
+  static_cast<void>(cudaStreamSynchronize(cuda_stream));
 }
 
 }  // namespace
@@ -208,7 +159,7 @@ __global__ void YoloCompactKernel(const float* predictions, bool channel_first,
 YoloDecodeResult RunYoloDecodeOnDevice(
     const Tensor& predictions, int64_t batch_count, int64_t channel_count,
     int64_t candidate_count, bool channel_first, YoloDecodeOptions options,
-    TensorAllocator& allocator) {
+    TensorAllocator& allocator, ExecutionStream* execution_stream) {
   const int batches = CheckedInt64ToInt(batch_count, "YOLO batch count");
   const int channels = CheckedInt64ToInt(channel_count, "YOLO channel count");
   const int candidates =
@@ -219,63 +170,32 @@ YoloDecodeResult RunYoloDecodeOnDevice(
   const int total_candidates = batches * candidates;
   const bool has_objectness = HasObjectness(options.version);
   const int class_start = ClassStart(options.version);
+  const int class_count = channels - class_start;
   CheckCuda(cudaSetDevice(predictions.device().id), "cudaSetDevice");
+  const cudaStream_t cuda_stream = execution_stream == nullptr
+                                       ? cudaStream_t{}
+                                       : execution_stream->cuda_handle();
 
-  Tensor boxes = Tensor::Allocate(
-      MakeFloatDesc("yolo_boxes", {total_candidates, 4}, predictions.device()),
-      allocator);
-  Tensor nms_boxes =
-      Tensor::Allocate(MakeFloatDesc("yolo_nms_boxes", {total_candidates, 4},
-                                     predictions.device()),
-                       allocator);
-  Tensor scores = Tensor::Allocate(
-      MakeFloatDesc("yolo_scores", {total_candidates}, predictions.device()),
-      allocator);
-  Tensor class_ids = Tensor::Allocate(
-      MakeClassIdDesc({total_candidates}, predictions.device()), allocator);
-  Tensor batch_ids = Tensor::Allocate(
-      MakeBatchIdDesc({total_candidates}, predictions.device()), allocator);
-
-  thrust::device_vector<int> flags(total_candidates, 0);
-  const int blocks =
-      (total_candidates + kThreadsPerBlock - 1) / kThreadsPerBlock;
-  YoloMarkCandidatesKernel<<<blocks, kThreadsPerBlock>>>(
-      static_cast<const float*>(predictions.data()), channel_first, batches,
-      channels, candidates, class_start, has_objectness,
-      options.score_threshold, thrust::raw_pointer_cast(flags.data()));
-  CheckCuda(cudaGetLastError(), "YoloMarkCandidatesKernel");
-
-  thrust::device_vector<int> offsets(total_candidates, 0);
-  thrust::exclusive_scan(flags.begin(), flags.end(), offsets.begin());
-
-  std::vector<int> tail_flag(1);
-  std::vector<int> tail_offset(1);
-  thrust::copy(flags.end() - 1, flags.end(), tail_flag.begin());
-  thrust::copy(offsets.end() - 1, offsets.end(), tail_offset.begin());
-  const int64_t output_count =
-      static_cast<int64_t>(tail_flag[0] + tail_offset[0]);
-
-  if (output_count > 0) {
-    YoloCompactKernel<<<blocks, kThreadsPerBlock>>>(
-        static_cast<const float*>(predictions.data()), channel_first, batches,
-        channels, candidates, class_start, has_objectness, options.class_offset,
-        thrust::raw_pointer_cast(flags.data()),
-        thrust::raw_pointer_cast(offsets.data()),
-        static_cast<float*>(boxes.data()),
-        static_cast<float*>(nms_boxes.data()),
-        static_cast<float*>(scores.data()),
-        static_cast<int64_t*>(class_ids.data()),
-        static_cast<int64_t*>(batch_ids.data()));
-    CheckCuda(cudaGetLastError(), "YoloCompactKernel");
+  YoloDecodeResult result = AllocateResult(
+      predictions, batch_count, candidate_count, class_count, allocator);
+  if (total_candidates == 0) {
+    return result;
   }
 
-  return YoloDecodeResult{
-      ViewTensor(boxes, {output_count, 4}),
-      ViewTensor(nms_boxes, {output_count, 4}),
-      ViewTensor(scores, {output_count}),
-      ViewTensor(class_ids, {output_count}),
-      ViewTensor(batch_ids, {output_count}),
-  };
+  try {
+    const int blocks =
+        (total_candidates + kThreadsPerBlock - 1) / kThreadsPerBlock;
+    YoloDecodeKernel<<<blocks, kThreadsPerBlock, 0, cuda_stream>>>(
+        static_cast<const float*>(predictions.data()), channel_first, batches,
+        channels, candidates, class_start, has_objectness,
+        static_cast<float*>(result.boxes.data()),
+        static_cast<float*>(result.scores.data()));
+    CheckCuda(cudaGetLastError(), "YoloDecodeKernel");
+  } catch (...) {
+    SynchronizeNoThrow(execution_stream, cuda_stream);
+    throw;
+  }
+  return result;
 }
 
 }  // namespace mw::infer::postprocess_internal

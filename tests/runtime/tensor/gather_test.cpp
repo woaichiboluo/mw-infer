@@ -9,6 +9,8 @@
 #include <utility>
 #include <vector>
 
+#include "mw/infer/runtime/execution_stream.h"
+
 #if defined(MW_INFER_HAS_CUDA_TENSOR_OPS)
 #include <cuda_runtime_api.h>
 #endif
@@ -226,6 +228,21 @@ TEST(GatherRowsTest, DispatchesCudaTensorByInputDevice) {
   EXPECT_EQ(CopyCudaFloats(selected),
             std::vector<float>(
                 {0.0F, 0.0F, 10.0F, 10.0F, 20.0F, 20.0F, 30.0F, 30.0F}));
+}
+
+TEST(GatherRowsTest, UsesProvidedCudaExecutionStream) {
+  if (!HasUsableCudaDevice()) {
+    GTEST_SKIP() << "CUDA tensor ops are unavailable";
+  }
+  ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+  Tensor values = MakeCudaFloatTensor({3}, {1.0F, 2.0F, 3.0F}, "values");
+  Tensor indices = MakeCudaInt64Tensor({2}, {2, 0}, "indices");
+  ExecutionStream stream(Device{DeviceType::kCuda, 0});
+
+  Tensor selected =
+      GatherRows(values, indices, TensorAllocator::Default(), &stream);
+
+  EXPECT_EQ(CopyCudaFloats(selected), std::vector<float>({3.0F, 1.0F}));
 }
 
 TEST(GatherRowsTest, RejectsCudaOutOfRangeIndex) {

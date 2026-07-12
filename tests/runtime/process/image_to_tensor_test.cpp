@@ -112,6 +112,27 @@ TEST(ImageToTensorConverterTest, UsesModelInputDataType) {
   EXPECT_EQ(static_cast<uint8_t*>(tensor.data())[0], 255);
 }
 
+TEST(ImageToTensorConverterTest, StreamOverloadForwardsToSynchronousAdapter) {
+  ImageToTensorConverter converter = MakeConverter();
+  RawImageBatch images({MakeRawImage(ImageMemoryKind::kHost)});
+  ExecutionStream stream(Device{DeviceType::kCpu, 0});
+
+  Tensor tensor = converter.Convert(images, Device{DeviceType::kCpu, 0},
+                                    MakeInput(), stream);
+
+  EXPECT_FLOAT_EQ(static_cast<float*>(tensor.data())[0], 1.25F);
+}
+
+TEST(ImageToTensorConverterTest, RejectsStreamOnDifferentDevice) {
+  ImageToTensorConverter converter = MakeConverter();
+  RawImageBatch images({MakeRawImage(ImageMemoryKind::kHost)});
+  ExecutionStream stream(Device{DeviceType::kCpu, 1});
+
+  EXPECT_THROW(static_cast<void>(converter.Convert(
+                   images, Device{DeviceType::kCpu, 0}, MakeInput(), stream)),
+               std::invalid_argument);
+}
+
 TEST(ImageToTensorConverterTest, ReusesPooledAllocatorWhenProvided) {
   ImageToTensorConverter converter = MakeConverter();
   RawImageBatch images({MakeRawImage(ImageMemoryKind::kHost)});

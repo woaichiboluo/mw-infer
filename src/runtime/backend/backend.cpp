@@ -7,6 +7,14 @@
 
 namespace mw::infer {
 
+namespace {
+
+bool SameDevice(Device lhs, Device rhs) {
+  return lhs.type == rhs.type && lhs.id == rhs.id;
+}
+
+}  // namespace
+
 #if defined(MW_INFER_HAS_ONNXRUNTIME_BACKEND)
 std::unique_ptr<BackendAdapter> CreateOnnxCpuBackendAdapter();
 #endif
@@ -26,6 +34,23 @@ std::vector<Tensor> IBackend::Infer(const std::vector<Tensor>& inputs,
     output = output.CopyTo(output.device(), allocator);
   }
   return outputs;
+}
+
+BackendPtr BackendAdapter::Create(
+    Model model, Device execution_device, std::vector<std::string> output_names,
+    std::shared_ptr<ExecutionStream> execution_stream) const {
+  if (!execution_stream) {
+    throw std::invalid_argument("Backend execution stream is null");
+  }
+  if (!SameDevice(execution_stream->device(), execution_device)) {
+    throw std::invalid_argument(
+        "Backend execution stream device does not match backend device");
+  }
+  if (execution_device.type == DeviceType::kCuda) {
+    throw std::runtime_error(
+        "Backend adapter does not support an external CUDA stream");
+  }
+  return Create(std::move(model), execution_device, std::move(output_names));
 }
 
 BackendFactory::BackendFactory() {
@@ -82,10 +107,39 @@ BackendPtr BackendFactory::Create(Model model, Device execution_device,
   throw std::invalid_argument("No backend adapter supports model");
 }
 
+BackendPtr BackendFactory::Create(
+    Model model, Device execution_device, std::vector<std::string> output_names,
+    std::shared_ptr<ExecutionStream> execution_stream) const {
+  if (!execution_stream) {
+    throw std::invalid_argument("Backend execution stream is null");
+  }
+  if (!SameDevice(execution_stream->device(), execution_device)) {
+    throw std::invalid_argument(
+        "Backend execution stream device does not match backend device");
+  }
+  for (const auto& adapter : adapters_) {
+    if (adapter->Supports(model, execution_device)) {
+      return adapter->Create(std::move(model), execution_device,
+                             std::move(output_names),
+                             std::move(execution_stream));
+    }
+  }
+
+  throw std::invalid_argument("No backend adapter supports model");
+}
+
 BackendPtr CreateBackend(Model model, Device execution_device,
                          std::vector<std::string> output_names) {
   return BackendFactory().Create(std::move(model), execution_device,
                                  std::move(output_names));
+}
+
+BackendPtr CreateBackend(Model model, Device execution_device,
+                         std::vector<std::string> output_names,
+                         std::shared_ptr<ExecutionStream> execution_stream) {
+  return BackendFactory().Create(std::move(model), execution_device,
+                                 std::move(output_names),
+                                 std::move(execution_stream));
 }
 
 }  // namespace mw::infer

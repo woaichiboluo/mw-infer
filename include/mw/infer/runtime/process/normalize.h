@@ -3,6 +3,7 @@
 
 #include <vector>
 
+#include "mw/infer/runtime/execution_stream.h"
 #include "mw/infer/runtime/process/image_to_tensor.h"
 #include "mw/infer/runtime/tensor/tensor.h"
 
@@ -10,6 +11,14 @@ namespace mw::infer {
 
 Tensor Normalize(const Tensor& input, const std::vector<float>& mean,
                  const std::vector<float>& stddev, float scale = 1.0F,
+                 TensorLayout layout = TensorLayout::kBchw,
+                 TensorAllocator& allocator = TensorAllocator::Default());
+
+// CUDA work is enqueued on stream. Keep output alive until the stream is
+// synchronized. CPU work remains synchronous.
+Tensor Normalize(const Tensor& input, const std::vector<float>& mean,
+                 const std::vector<float>& stddev, ExecutionStream& stream,
+                 float scale = 1.0F,
                  TensorLayout layout = TensorLayout::kBchw,
                  TensorAllocator& allocator = TensorAllocator::Default());
 

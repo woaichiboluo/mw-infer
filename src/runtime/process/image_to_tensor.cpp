@@ -138,6 +138,10 @@ TensorDesc MakeTensorDesc(const RawImageBatch& images, Device target_device,
   return desc;
 }
 
+bool SameDevice(Device lhs, Device rhs) {
+  return lhs.type == rhs.type && lhs.id == rhs.id;
+}
+
 }  // namespace
 
 ImageToTensorConverter::ImageToTensorConverter() {
@@ -200,6 +204,45 @@ Tensor ImageToTensorConverter::Convert(const RawImageBatch& images,
   return output;
 }
 
+Tensor ImageToTensorConverter::Convert(const RawImageBatch& images,
+                                       Device target_device,
+                                       const TensorInfo& input,
+                                       ExecutionStream& stream,
+                                       TensorLayout layout,
+                                       TensorAllocator& allocator) const {
+  ValidateRawImages(images);
+  ValidateTargetDevice(target_device);
+  ValidateLayout(layout);
+  ValidateInputInfo(input);
+  if (!SameDevice(target_device, stream.device())) {
+    throw std::invalid_argument(
+        "Image-to-tensor stream device does not match target device");
+  }
+
+  const ImageToTensorAdapter& adapter =
+      SelectAdapter(images, target_device, input, layout);
+  const TensorDesc output_desc =
+      MakeTensorDesc(images, target_device, input, layout);
+  struct StreamOutputOwner {
+    Tensor storage;
+    RawImageBatch images;
+  };
+  auto owner = std::make_shared<StreamOutputOwner>();
+  owner->storage = Tensor::Allocate(output_desc, allocator);
+  owner->images = images;
+  std::shared_ptr<void> output_owner = owner;
+  Tensor output = Tensor::FromExternal(
+      output_desc, owner->storage.data(), owner->storage.bytes(),
+      std::move(output_owner));
+  try {
+    adapter.Convert(owner->images, &output, stream, layout);
+  } catch (...) {
+    stream.SynchronizeNoThrow();
+    throw;
+  }
+  return output;
+}
+
 const ImageToTensorAdapter& ImageToTensorConverter::SelectAdapter(
     const RawImageBatch& images, Device target_device, const TensorInfo& input,
     TensorLayout layout) const {
@@ -217,6 +260,13 @@ Tensor ToTensor(const RawImageBatch& images, Device target_device,
                 TensorAllocator& allocator) {
   return ImageToTensorConverter().Convert(images, target_device, input, layout,
                                           allocator);
+}
+
+Tensor ToTensor(const RawImageBatch& images, Device target_device,
+                const TensorInfo& input, ExecutionStream& stream,
+                TensorLayout layout, TensorAllocator& allocator) {
+  return ImageToTensorConverter().Convert(images, target_device, input, stream,
+                                           layout, allocator);
 }
 
 }  // namespace mw::infer

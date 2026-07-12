@@ -35,7 +35,10 @@ class DirectTensorAllocator final : public TensorAllocator {
 class PooledTensorAllocator final : public TensorAllocator {
  public:
   // The allocator is single-thread-affine. Returned tensors may be destroyed
-  // on other threads and may outlive the allocator.
+  // on other threads and may outlive the allocator. A block becomes reusable
+  // when no returned tensor or view owns it; asynchronous callers must retain
+  // those owners until device work completes or synchronize before releasing
+  // them.
   PooledTensorAllocator();
   explicit PooledTensorAllocator(std::unique_ptr<TensorAllocator> upstream);
   ~PooledTensorAllocator() override;

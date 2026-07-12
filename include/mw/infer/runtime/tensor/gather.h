@@ -6,8 +6,11 @@
 
 namespace mw::infer {
 
+// A provided CUDA stream orders gather after work already queued on that
+// stream. Gather synchronizes before returning to report invalid indices.
 Tensor GatherRows(const Tensor& data, const Tensor& indices,
-                  TensorAllocator& allocator = TensorAllocator::Default());
+                  TensorAllocator& allocator = TensorAllocator::Default(),
+                  ExecutionStream* execution_stream = nullptr);
 
 }  // namespace mw::infer
 

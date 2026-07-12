@@ -9,7 +9,6 @@ namespace mw::infer::postprocess_internal {
 
 struct YoloSegCandidates {
   Tensor boxes;
-  Tensor nms_boxes;
   Tensor scores;
   Tensor class_ids;
   Tensor batch_ids;
@@ -19,19 +18,21 @@ struct YoloSegCandidates {
 YoloSegCandidates RunRawYoloSegDecodeOnDevice(
     const Tensor& predictions, int64_t batch_count, int64_t channel_count,
     int64_t candidate_count, bool channel_first, int64_t class_count,
-    YoloSegDecodeOptions options, TensorAllocator& allocator);
+    YoloSegDecodeOptions options, TensorAllocator& allocator,
+    ExecutionStream* execution_stream);
 
 YoloSegCandidates RunSelectedYoloSegDecodeOnDevice(
     const Tensor& predictions, int64_t batch_count, int64_t channel_count,
     int64_t candidate_count, bool channel_first, YoloSegDecodeOptions options,
-    TensorAllocator& allocator);
+    TensorAllocator& allocator, ExecutionStream* execution_stream);
 
 Tensor RunYoloSegMasksOnDevice(
     const Tensor& predictions, const Tensor& prototypes, const Tensor& boxes,
     const Tensor& batch_ids, const Tensor& candidate_ids, int64_t channel_count,
     int64_t candidate_count, bool channel_first, int64_t coefficient_start,
     bool scale_coefficients_by_objectness, ImageSize input_size,
-    float mask_threshold, TensorAllocator& allocator);
+    float mask_threshold, TensorAllocator& allocator,
+    ExecutionStream* execution_stream);
 
 }  // namespace mw::infer::postprocess_internal
 

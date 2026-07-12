@@ -72,6 +72,17 @@ class RawImage {
                     handle_kind);
   }
 
+  template <typename Handle>
+  static RawImage FromSharedHandle(ImageDesc desc,
+                                   ImageHandleKind handle_kind,
+                                   std::shared_ptr<Handle> handle) {
+    if (!handle) {
+      throw std::invalid_argument("RawImage shared handle is null");
+    }
+    std::shared_ptr<const void> erased_handle = std::move(handle);
+    return RawImage(std::move(desc), std::move(erased_handle), handle_kind);
+  }
+
   bool empty() const { return !handle_; }
   const ImageDesc& desc() const { return desc_; }
   ImageSize size() const { return desc_.size; }

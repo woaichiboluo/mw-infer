@@ -3,6 +3,8 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -12,6 +14,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -64,6 +67,12 @@ void CheckTrue(bool value, const char* operation) {
   if (!value) {
     throw std::runtime_error(std::string(operation) + " failed");
   }
+}
+
+void CUDART_CB MarkCompleteAfterDelay(void* opaque) noexcept {
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  static_cast<std::atomic<bool>*>(opaque)->store(true,
+                                                 std::memory_order_release);
 }
 
 nvinfer1::Dims MakeDims(std::vector<int64_t> shape) {
@@ -304,6 +313,32 @@ Tensor MakeCudaFloatTensor(std::string name, std::vector<int64_t> shape,
   return tensor;
 }
 
+TensorDesc MakeCudaFloatDesc(std::vector<int64_t> shape) {
+  TensorDesc desc;
+  desc.info.data_type = DataType::kFloat32;
+  desc.info.shape = std::move(shape);
+  desc.device = CudaDevice();
+  return desc;
+}
+
+class CountingTensorAllocator final : public TensorAllocator {
+ public:
+  bool Supports(Device device) const override {
+    return allocator_.Supports(device);
+  }
+
+  Tensor Allocate(TensorDesc desc) override {
+    ++allocation_count_;
+    return allocator_.Allocate(std::move(desc));
+  }
+
+  std::size_t allocation_count() const { return allocation_count_; }
+
+ private:
+  DirectTensorAllocator allocator_;
+  std::size_t allocation_count_ = 0;
+};
+
 std::vector<float> Sequence(std::size_t count, float offset) {
   std::vector<float> values(count);
   for (std::size_t index = 0; index < count; ++index) {
@@ -415,6 +450,188 @@ TEST(TensorRtBackendTest, RunsStaticSingleInputEngineWithUnnamedTensor) {
   EXPECT_EQ(outputs[0].shape(), std::vector<int64_t>({2, 3}));
   EXPECT_EQ(outputs[0].device().type, DeviceType::kCuda);
   ExpectFloatValues(outputs[0], values);
+}
+
+TEST(TensorRtBackendTest, RunsWithInjectedExecutionStream) {
+  if (!HasUsableCudaDevice()) {
+    GTEST_SKIP() << "CUDA device is unavailable";
+  }
+
+  auto stream = std::make_shared<ExecutionStream>(CudaDevice());
+  BackendPtr backend =
+      CreateBackend(StaticIdentityEngineModel(), CudaDevice(), {}, stream);
+
+  const std::vector<float> values = Sequence(6, 10.0F);
+  Tensor input = MakeCudaFloatTensor("", {2, 3}, values);
+  std::atomic<bool> preceding_work_completed{false};
+  ASSERT_EQ(cudaLaunchHostFunc(stream->cuda_handle(), MarkCompleteAfterDelay,
+                               &preceding_work_completed),
+            cudaSuccess);
+  std::vector<Tensor> outputs = backend->Infer(input);
+
+  EXPECT_FALSE(preceding_work_completed.load(std::memory_order_acquire));
+  stream->Synchronize();
+
+  ASSERT_EQ(outputs.size(), 1U);
+  EXPECT_TRUE(preceding_work_completed.load(std::memory_order_acquire));
+  ExpectFloatValues(outputs[0], values);
+}
+
+TEST(TensorRtBackendTest,
+     RetainsCudaInputsAndSelectedOutputsUntilInjectedStreamCompletes) {
+  if (!HasUsableCudaDevice()) {
+    GTEST_SKIP() << "CUDA device is unavailable";
+  }
+
+  auto stream = std::make_shared<ExecutionStream>(CudaDevice());
+  BackendPtr backend =
+      CreateBackend(StaticIdentityEngineModel(), CudaDevice(), {}, stream);
+  auto upstream = std::make_unique<CountingTensorAllocator>();
+  CountingTensorAllocator* counting = upstream.get();
+  PooledTensorAllocator allocator(std::move(upstream));
+  const std::vector<float> values = Sequence(6, 10.0F);
+  Tensor input =
+      MakeCpuFloatTensor("", {2, 3}, values).CopyTo(CudaDevice(), allocator);
+  std::atomic<bool> preceding_work_completed{false};
+  ASSERT_EQ(cudaLaunchHostFunc(stream->cuda_handle(), MarkCompleteAfterDelay,
+                               &preceding_work_completed),
+            cudaSuccess);
+
+  std::vector<Tensor> outputs = backend->Infer(input, allocator);
+
+  EXPECT_FALSE(preceding_work_completed.load(std::memory_order_acquire));
+  ASSERT_EQ(outputs.size(), 1U);
+  EXPECT_EQ(counting->allocation_count(), 2U);
+  input = Tensor{};
+  outputs.clear();
+  {
+    Tensor first = Tensor::Allocate(MakeCudaFloatDesc({2, 3}), allocator);
+    Tensor second = Tensor::Allocate(MakeCudaFloatDesc({2, 3}), allocator);
+    EXPECT_EQ(counting->allocation_count(), 4U);
+  }
+
+  stream->Synchronize();
+  Tensor second_input = MakeCudaFloatTensor("", {2, 3}, values);
+  std::vector<Tensor> second_outputs =
+      backend->Infer(second_input, allocator);
+  EXPECT_EQ(counting->allocation_count(), 4U);
+  stream->Synchronize();
+  ASSERT_EQ(second_outputs.size(), 1U);
+  ExpectFloatValues(second_outputs[0], values);
+}
+
+TEST(TensorRtBackendTest, WaitsForInjectedStreamBeforeDestroyingSession) {
+  if (!HasUsableCudaDevice()) {
+    GTEST_SKIP() << "CUDA device is unavailable";
+  }
+
+  auto stream = std::make_shared<ExecutionStream>(CudaDevice());
+  BackendPtr backend =
+      CreateBackend(DynamicAddEngineModel(), CudaDevice(), {}, stream);
+  PooledTensorAllocator allocator;
+  const std::vector<float> lhs = Sequence(6, 1.0F);
+  const std::vector<float> rhs = Sequence(6, 100.0F);
+  Tensor lhs_tensor = MakeCpuFloatTensor("lhs", {2, 3}, lhs);
+  Tensor rhs_tensor = MakeCpuFloatTensor("rhs", {2, 3}, rhs);
+  std::atomic<bool> preceding_work_completed{false};
+  ASSERT_EQ(cudaLaunchHostFunc(stream->cuda_handle(), MarkCompleteAfterDelay,
+                               &preceding_work_completed),
+            cudaSuccess);
+
+  std::vector<Tensor> outputs =
+      backend->Infer({rhs_tensor, lhs_tensor}, allocator);
+  ASSERT_FALSE(preceding_work_completed.load(std::memory_order_acquire));
+
+  backend.reset();
+
+  EXPECT_TRUE(preceding_work_completed.load(std::memory_order_acquire));
+  ASSERT_EQ(outputs.size(), 1U);
+  ExpectFloatValues(outputs[0], Sum(lhs, rhs));
+}
+
+TEST(TensorRtBackendTest, KeepsStagedInputsAliveUntilInjectedStreamCompletes) {
+  if (!HasUsableCudaDevice()) {
+    GTEST_SKIP() << "CUDA device is unavailable";
+  }
+
+  auto stream = std::make_shared<ExecutionStream>(CudaDevice());
+  BackendPtr backend =
+      CreateBackend(DynamicAddEngineModel(), CudaDevice(), {}, stream);
+  auto upstream = std::make_unique<CountingTensorAllocator>();
+  CountingTensorAllocator* counting = upstream.get();
+  PooledTensorAllocator allocator(std::move(upstream));
+  const std::vector<float> lhs = Sequence(6, 1.0F);
+  const std::vector<float> rhs = Sequence(6, 100.0F);
+  Tensor lhs_tensor = MakeCpuFloatTensor("lhs", {2, 3}, lhs);
+  Tensor rhs_tensor = MakeCpuFloatTensor("rhs", {2, 3}, rhs);
+  std::atomic<bool> preceding_work_completed{false};
+  ASSERT_EQ(cudaLaunchHostFunc(stream->cuda_handle(), MarkCompleteAfterDelay,
+                               &preceding_work_completed),
+            cudaSuccess);
+
+  std::vector<Tensor> outputs =
+      backend->Infer({rhs_tensor, lhs_tensor}, allocator);
+
+  EXPECT_FALSE(preceding_work_completed.load(std::memory_order_acquire));
+  ASSERT_EQ(outputs.size(), 1U);
+  EXPECT_EQ(counting->allocation_count(), 3U);
+  {
+    Tensor scratch = Tensor::Allocate(MakeCudaFloatDesc({2, 3}), allocator);
+    EXPECT_EQ(counting->allocation_count(), 4U);
+  }
+  stream->Synchronize();
+  ExpectFloatValues(outputs[0], Sum(lhs, rhs));
+
+  std::vector<Tensor> second_outputs =
+      backend->Infer({rhs_tensor, lhs_tensor}, allocator);
+  EXPECT_EQ(counting->allocation_count(), 4U);
+  stream->Synchronize();
+  ASSERT_EQ(second_outputs.size(), 1U);
+  ExpectFloatValues(second_outputs[0], Sum(lhs, rhs));
+}
+
+TEST(TensorRtBackendTest,
+     KeepsUnselectedOutputsAliveUntilInjectedStreamCompletes) {
+  if (!HasUsableCudaDevice()) {
+    GTEST_SKIP() << "CUDA device is unavailable";
+  }
+
+  auto stream = std::make_shared<ExecutionStream>(CudaDevice());
+  BackendPtr backend = CreateBackend(DynamicAddSubEngineModel(), CudaDevice(),
+                                     {"sum"}, stream);
+  auto upstream = std::make_unique<CountingTensorAllocator>();
+  CountingTensorAllocator* counting = upstream.get();
+  PooledTensorAllocator allocator(std::move(upstream));
+  const std::vector<float> lhs = Sequence(6, 1.0F);
+  const std::vector<float> rhs = Sequence(6, 100.0F);
+  Tensor lhs_tensor = MakeCudaFloatTensor("lhs", {2, 3}, lhs);
+  Tensor rhs_tensor = MakeCudaFloatTensor("rhs", {2, 3}, rhs);
+  std::atomic<bool> preceding_work_completed{false};
+  ASSERT_EQ(cudaLaunchHostFunc(stream->cuda_handle(), MarkCompleteAfterDelay,
+                               &preceding_work_completed),
+            cudaSuccess);
+
+  std::vector<Tensor> outputs =
+      backend->Infer({rhs_tensor, lhs_tensor}, allocator);
+
+  EXPECT_FALSE(preceding_work_completed.load(std::memory_order_acquire));
+  ASSERT_EQ(outputs.size(), 1U);
+  EXPECT_EQ(outputs[0].name(), "sum");
+  EXPECT_EQ(counting->allocation_count(), 2U);
+  {
+    Tensor scratch = Tensor::Allocate(MakeCudaFloatDesc({2, 3}), allocator);
+    EXPECT_EQ(counting->allocation_count(), 3U);
+  }
+  stream->Synchronize();
+  ExpectFloatValues(outputs[0], Sum(lhs, rhs));
+
+  std::vector<Tensor> second_outputs =
+      backend->Infer({rhs_tensor, lhs_tensor}, allocator);
+  EXPECT_EQ(counting->allocation_count(), 3U);
+  stream->Synchronize();
+  ASSERT_EQ(second_outputs.size(), 1U);
+  EXPECT_EQ(second_outputs[0].name(), "sum");
+  ExpectFloatValues(second_outputs[0], Sum(lhs, rhs));
 }
 
 TEST(TensorRtBackendTest, RunsMemoryEngineWithCudaInputsAndOutputs) {

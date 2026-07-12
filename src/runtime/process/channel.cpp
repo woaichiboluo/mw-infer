@@ -13,7 +13,7 @@ namespace mw::infer {
 namespace process_internal {
 Tensor RunReorderChannelsOnDevice(const Tensor& input,
                                   const std::vector<int64_t>& order,
-                                  TensorLayout layout,
+                                  TensorLayout layout, ExecutionStream* stream,
                                   TensorAllocator& allocator);
 }  // namespace process_internal
 #endif
@@ -122,24 +122,45 @@ Tensor RunReorderChannelsOnHost(const Tensor& input,
   return output;
 }
 
-}  // namespace
+bool SameDevice(Device lhs, Device rhs) {
+  return lhs.type == rhs.type && lhs.id == rhs.id;
+}
 
-Tensor ReorderChannels(const Tensor& input, const std::vector<int64_t>& order,
-                       TensorLayout layout, TensorAllocator& allocator) {
+Tensor ReorderChannelsImpl(const Tensor& input,
+                           const std::vector<int64_t>& order,
+                           TensorLayout layout, ExecutionStream* stream,
+                           TensorAllocator& allocator) {
   const ImageTensorShape shape = ValidateImageTensor(input, layout);
   ValidateOrder(order, shape.channels);
+  if (stream != nullptr && !SameDevice(input.device(), stream->device())) {
+    throw std::invalid_argument(
+        "ReorderChannels stream device does not match input device");
+  }
   if (input.device().type == DeviceType::kCpu) {
     return RunReorderChannelsOnHost(input, order, shape, layout, allocator);
   }
   if (input.device().type == DeviceType::kCuda) {
 #if defined(MW_INFER_HAS_CUDA_PREPROCESS)
-    return process_internal::RunReorderChannelsOnDevice(input, order, layout,
-                                                        allocator);
+    return process_internal::RunReorderChannelsOnDevice(
+        input, order, layout, stream, allocator);
 #else
     throw std::runtime_error("CUDA preprocess is unavailable in this build");
 #endif
   }
   throw std::invalid_argument("ReorderChannels tensor device is unsupported");
+}
+
+}  // namespace
+
+Tensor ReorderChannels(const Tensor& input, const std::vector<int64_t>& order,
+                       TensorLayout layout, TensorAllocator& allocator) {
+  return ReorderChannelsImpl(input, order, layout, nullptr, allocator);
+}
+
+Tensor ReorderChannels(const Tensor& input, const std::vector<int64_t>& order,
+                       ExecutionStream& stream, TensorLayout layout,
+                       TensorAllocator& allocator) {
+  return ReorderChannelsImpl(input, order, layout, &stream, allocator);
 }
 
 }  // namespace mw::infer

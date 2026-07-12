@@ -3,11 +3,17 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <future>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
+
+#include "mw/infer/runtime/execution_stream.h"
 
 #if defined(MW_INFER_HAS_CUDA_POSTPROCESS)
 #include <cuda_runtime_api.h>
@@ -331,7 +337,7 @@ TEST(YoloSegDecodeTest, ResolvesAmbiguousSelectedLayoutAsCandidateFirst) {
   EXPECT_EQ(CopyInt64s(result.class_ids), std::vector<int64_t>({1}));
 }
 
-TEST(YoloSegDecodeTest, DerivesNmsGroupingFromActualBoxCoordinates) {
+TEST(YoloSegDecodeTest, KeepsLargeCoordinateBoxesAcrossClasses) {
   Tensor prediction_tensor = MakeCpuFloatTensor(
       {1, 2, 8}, LargeCoordinateRawPredictions(), "predictions");
   Tensor prototype_tensor = MakeCpuFloatTensor(
@@ -490,6 +496,111 @@ bool HasUsableCudaDevice() {
   return cudaGetDeviceCount(&count) == cudaSuccess && count > 0;
 }
 
+struct StreamIsolationState {
+  std::mutex mutex;
+  std::condition_variable changed;
+  bool mask_values_allocated = false;
+  bool unrelated_callback_started = false;
+  bool decode_returned = false;
+  bool allow_decode = false;
+  bool release_all = false;
+};
+
+template <typename Predicate>
+bool WaitForState(StreamIsolationState& state, Predicate predicate) {
+  std::unique_lock<std::mutex> lock(state.mutex);
+  return state.changed.wait_for(lock, std::chrono::seconds(5), predicate);
+}
+
+void ReleaseStreamIsolationState(StreamIsolationState& state) noexcept {
+  {
+    std::lock_guard<std::mutex> lock(state.mutex);
+    state.allow_decode = true;
+    state.release_all = true;
+  }
+  state.changed.notify_all();
+}
+
+void CUDART_CB BlockUnrelatedStream(void* opaque) noexcept {
+  auto& state = *static_cast<StreamIsolationState*>(opaque);
+  std::unique_lock<std::mutex> lock(state.mutex);
+  state.unrelated_callback_started = true;
+  state.changed.notify_all();
+  state.changed.wait(lock, [&state] { return state.release_all; });
+}
+
+class StreamIsolationCleanup {
+ public:
+  StreamIsolationCleanup(StreamIsolationState& state, cudaStream_t& stream,
+                         cudaEvent_t& event)
+      : state_(state), stream_(stream), event_(event) {}
+
+  StreamIsolationCleanup(const StreamIsolationCleanup&) = delete;
+  StreamIsolationCleanup& operator=(const StreamIsolationCleanup&) = delete;
+
+  ~StreamIsolationCleanup() { Run(); }
+
+  void Run() noexcept {
+    if (cleaned_) {
+      return;
+    }
+    cleaned_ = true;
+    ReleaseStreamIsolationState(state_);
+    if (stream_ != nullptr) {
+      sync_status = cudaStreamSynchronize(stream_);
+    }
+    if (event_ != nullptr) {
+      event_destroy_status = cudaEventDestroy(event_);
+      event_ = nullptr;
+    }
+    if (stream_ != nullptr) {
+      stream_destroy_status = cudaStreamDestroy(stream_);
+      stream_ = nullptr;
+    }
+  }
+
+  cudaError_t sync_status = cudaErrorInvalidResourceHandle;
+  cudaError_t event_destroy_status = cudaErrorInvalidResourceHandle;
+  cudaError_t stream_destroy_status = cudaErrorInvalidResourceHandle;
+
+ private:
+  StreamIsolationState& state_;
+  cudaStream_t& stream_;
+  cudaEvent_t& event_;
+  bool cleaned_ = false;
+};
+
+class MaskAllocationGate final : public TensorAllocator {
+ public:
+  MaskAllocationGate(PooledTensorAllocator& upstream,
+                     StreamIsolationState& state)
+      : upstream_(upstream), state_(state) {}
+
+  bool Supports(Device device) const override {
+    return upstream_.Supports(device);
+  }
+
+  Tensor Allocate(TensorDesc desc) override {
+    const bool gate = !gated_ && desc.device.type == DeviceType::kCuda &&
+                      desc.info.name == "yolo_seg_mask_values";
+    Tensor tensor = upstream_.Allocate(std::move(desc));
+    if (gate) {
+      gated_ = true;
+      std::unique_lock<std::mutex> lock(state_.mutex);
+      state_.mask_values_allocated = true;
+      state_.changed.notify_all();
+      state_.changed.wait(
+          lock, [this] { return state_.allow_decode || state_.release_all; });
+    }
+    return tensor;
+  }
+
+ private:
+  PooledTensorAllocator& upstream_;
+  StreamIsolationState& state_;
+  bool gated_ = false;
+};
+
 Tensor ToCuda(const Tensor& tensor) {
   return tensor.CopyTo(Device{DeviceType::kCuda, 0});
 }
@@ -524,6 +635,29 @@ TEST(YoloSegDecodeTest, DecodesCudaYoloV8RawPredictions) {
   ExpectSameResult(expected, actual);
 }
 
+TEST(YoloSegDecodeTest, UsesProvidedCudaExecutionStreamForFullDecode) {
+  if (!HasUsableCudaDevice()) {
+    GTEST_SKIP() << "CUDA postprocess is unavailable";
+  }
+  ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+  Tensor cpu_predictions =
+      MakeCpuFloatTensor({1, 8, 3}, RawYoloV8Predictions(), "predictions");
+  Tensor cpu_prototypes =
+      MakeCpuFloatTensor({1, 2, 2, 2}, OneBatchPrototypes(), "prototypes");
+  const YoloSegDecodeOptions options = RawOptions(YoloVersion::kYoloV8);
+  const YoloSegDecodeResult expected =
+      YoloSegDecode(cpu_predictions, cpu_prototypes, ImageSize{4, 4}, options);
+  Tensor gpu_predictions = ToCuda(cpu_predictions);
+  Tensor gpu_prototypes = ToCuda(cpu_prototypes);
+  ExecutionStream stream(Device{DeviceType::kCuda, 0});
+
+  YoloSegDecodeResult actual =
+      YoloSegDecode(gpu_predictions, gpu_prototypes, ImageSize{4, 4}, options,
+                    TensorAllocator::Default(), &stream);
+
+  ExpectSameResult(expected, actual);
+}
+
 TEST(YoloSegDecodeTest, DecodesCudaYoloV5ObjectnessAndMaskCoefficients) {
   if (!HasUsableCudaDevice()) {
     GTEST_SKIP() << "CUDA postprocess is unavailable";
@@ -546,7 +680,7 @@ TEST(YoloSegDecodeTest, DecodesCudaYoloV5ObjectnessAndMaskCoefficients) {
   ExpectSameResult(expected, actual);
 }
 
-TEST(YoloSegDecodeTest, DerivesCudaNmsGroupingFromActualBoxCoordinates) {
+TEST(YoloSegDecodeTest, KeepsCudaLargeCoordinateBoxesAcrossClasses) {
   if (!HasUsableCudaDevice()) {
     GTEST_SKIP() << "CUDA postprocess is unavailable";
   }
@@ -611,6 +745,100 @@ TEST(YoloSegDecodeTest, DecodesCudaYoloV26SelectedPredictions) {
                     ImageSize{4, 4}, options);
 
   EXPECT_EQ(actual.masks.device().type, DeviceType::kCuda);
+  ExpectSameResult(expected, actual);
+}
+
+TEST(YoloSegDecodeTest, DoesNotWaitForUnrelatedNonBlockingStream) {
+  if (!HasUsableCudaDevice()) {
+    GTEST_SKIP() << "CUDA postprocess is unavailable";
+  }
+  ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+
+  Tensor cpu_predictions =
+      MakeCpuFloatTensor({1, 8, 3}, RawYoloV8Predictions(), "predictions");
+  Tensor cpu_prototypes =
+      MakeCpuFloatTensor({1, 2, 2, 2}, OneBatchPrototypes(), "prototypes");
+  Tensor gpu_predictions = ToCuda(cpu_predictions);
+  Tensor gpu_prototypes = ToCuda(cpu_prototypes);
+  const YoloSegDecodeOptions options = RawOptions(YoloVersion::kYoloV8);
+  const YoloSegDecodeResult expected =
+      YoloSegDecode(cpu_predictions, cpu_prototypes, ImageSize{4, 4}, options);
+
+  const YoloSegDecodeResult warmup =
+      YoloSegDecode(gpu_predictions, gpu_prototypes, ImageSize{4, 4}, options);
+  ExpectSameResult(expected, warmup);
+
+  StreamIsolationState state;
+  cudaStream_t unrelated_stream = nullptr;
+  cudaEvent_t unrelated_done = nullptr;
+  auto worker = std::async(std::launch::async, [&] {
+    PooledTensorAllocator pool;
+    MaskAllocationGate allocator(pool, state);
+    YoloSegDecodeResult result = YoloSegDecode(
+        gpu_predictions, gpu_prototypes, ImageSize{4, 4}, options, allocator);
+
+    std::unique_lock<std::mutex> lock(state.mutex);
+    state.decode_returned = true;
+    state.changed.notify_all();
+    state.changed.wait(lock, [&state] { return state.release_all; });
+    return result;
+  });
+  StreamIsolationCleanup cleanup(state, unrelated_stream, unrelated_done);
+
+  const bool reached_mask_allocation =
+      WaitForState(state, [&state] { return state.mask_values_allocated; });
+
+  cudaError_t create_stream_status = cudaErrorNotReady;
+  cudaError_t create_event_status = cudaErrorNotReady;
+  cudaError_t callback_status = cudaErrorNotReady;
+  cudaError_t record_event_status = cudaErrorNotReady;
+  bool callback_started = false;
+
+  if (reached_mask_allocation) {
+    create_stream_status =
+        cudaStreamCreateWithFlags(&unrelated_stream, cudaStreamNonBlocking);
+    if (create_stream_status == cudaSuccess) {
+      create_event_status =
+          cudaEventCreateWithFlags(&unrelated_done, cudaEventDisableTiming);
+    }
+    if (create_event_status == cudaSuccess) {
+      callback_status =
+          cudaLaunchHostFunc(unrelated_stream, BlockUnrelatedStream, &state);
+    }
+    if (callback_status == cudaSuccess) {
+      record_event_status = cudaEventRecord(unrelated_done, unrelated_stream);
+      callback_started = WaitForState(
+          state, [&state] { return state.unrelated_callback_started; });
+    }
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(state.mutex);
+    state.allow_decode = true;
+  }
+  state.changed.notify_all();
+
+  const bool returned_before_release =
+      callback_started &&
+      WaitForState(state, [&state] { return state.decode_returned; });
+  const cudaError_t unrelated_status = returned_before_release
+                                           ? cudaEventQuery(unrelated_done)
+                                           : cudaErrorNotReady;
+
+  cleanup.Run();
+  YoloSegDecodeResult actual = worker.get();
+
+  EXPECT_TRUE(reached_mask_allocation);
+  EXPECT_EQ(create_stream_status, cudaSuccess);
+  EXPECT_EQ(create_event_status, cudaSuccess);
+  EXPECT_EQ(callback_status, cudaSuccess);
+  EXPECT_EQ(record_event_status, cudaSuccess);
+  EXPECT_TRUE(callback_started);
+  EXPECT_TRUE(returned_before_release);
+  EXPECT_EQ(unrelated_status, cudaErrorNotReady);
+  EXPECT_EQ(cleanup.sync_status, cudaSuccess);
+  EXPECT_EQ(cleanup.event_destroy_status, cudaSuccess);
+  EXPECT_EQ(cleanup.stream_destroy_status, cudaSuccess);
   ExpectSameResult(expected, actual);
 }
 

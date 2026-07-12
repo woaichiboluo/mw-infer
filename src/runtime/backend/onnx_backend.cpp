@@ -23,6 +23,7 @@ struct OnnxBackendSessionOptions {
   OnnxBackendKind backend = OnnxBackendKind::kCpu;
   int device_id = 0;
   std::vector<std::string> output_names;
+  std::shared_ptr<ExecutionStream> execution_stream;
 };
 
 DataType FromOrtDataType(ONNXTensorElementDataType data_type) {
@@ -128,6 +129,13 @@ Ort::SessionOptions MakeSessionOptions(
     Ort::CUDAProviderOptions cuda_options;
     cuda_options.Update(std::unordered_map<std::string, std::string>{
         {"device_id", std::to_string(options.device_id)}});
+#if defined(MW_INFER_HAS_CUDA_RUNTIME)
+    if (options.execution_stream) {
+      cuda_options.UpdateWithValue(
+          "user_compute_stream",
+          static_cast<void*>(options.execution_stream->cuda_handle()));
+    }
+#endif
     session_options.AppendExecutionProvider_CUDA_V2(*cuda_options);
 #else
     throw std::runtime_error(
@@ -255,6 +263,14 @@ void ValidateOptions(const OnnxBackendSessionOptions& options) {
     throw std::runtime_error(
         "ONNX Runtime GPU backend requires CUDA provider, but this ONNX "
         "Runtime build does not provide it");
+  }
+  if (options.execution_stream) {
+    const Device expected = ResultDevice(options);
+    const Device actual = options.execution_stream->device();
+    if (actual.type != expected.type || actual.id != expected.id) {
+      throw std::invalid_argument(
+          "ONNX execution stream device does not match backend device");
+    }
   }
 }
 
@@ -458,29 +474,35 @@ class OnnxBackendSession {
 };
 
 OnnxBackendSessionOptions MakeCpuOptions(
-    std::vector<std::string> output_names) {
+    std::vector<std::string> output_names,
+    std::shared_ptr<ExecutionStream> execution_stream = nullptr) {
   OnnxBackendSessionOptions session_options;
   session_options.backend = OnnxBackendKind::kCpu;
   session_options.output_names = std::move(output_names);
+  session_options.execution_stream = std::move(execution_stream);
   return session_options;
 }
 
 OnnxBackendSessionOptions MakeGpuOptions(
-    int device_id, std::vector<std::string> output_names) {
+    int device_id, std::vector<std::string> output_names,
+    std::shared_ptr<ExecutionStream> execution_stream = nullptr) {
   OnnxBackendSessionOptions session_options;
   session_options.backend = OnnxBackendKind::kGpu;
   session_options.device_id = device_id;
   session_options.output_names = std::move(output_names);
+  session_options.execution_stream = std::move(execution_stream);
   return session_options;
 }
 
 class OnnxCpuBackend final : public IBackend {
  public:
   OnnxCpuBackend(Model model, Device execution_device,
-                 std::vector<std::string> output_names)
+                 std::vector<std::string> output_names,
+                 std::shared_ptr<ExecutionStream> execution_stream = nullptr)
       : IBackend(std::move(model), execution_device),
-        session_(MakeCpuOptions(std::move(output_names)), mutable_model(),
-                 mutable_model().info) {}
+        session_(MakeCpuOptions(std::move(output_names),
+                                std::move(execution_stream)),
+                 mutable_model(), mutable_model().info) {}
 
   std::vector<Tensor> Infer(const std::vector<Tensor>& inputs) override {
     return session_.Infer(inputs, model_info());
@@ -493,9 +515,11 @@ class OnnxCpuBackend final : public IBackend {
 class OnnxGpuBackend final : public IBackend {
  public:
   OnnxGpuBackend(Model model, Device execution_device,
-                 std::vector<std::string> output_names)
+                 std::vector<std::string> output_names,
+                 std::shared_ptr<ExecutionStream> execution_stream = nullptr)
       : IBackend(std::move(model), execution_device),
-        session_(MakeGpuOptions(execution_device.id, std::move(output_names)),
+        session_(MakeGpuOptions(execution_device.id, std::move(output_names),
+                                std::move(execution_stream)),
                  mutable_model(), mutable_model().info) {}
 
   std::vector<Tensor> Infer(const std::vector<Tensor>& inputs) override {
@@ -518,6 +542,15 @@ class OnnxCpuBackendAdapter final : public BackendAdapter {
     return std::make_unique<OnnxCpuBackend>(std::move(model), execution_device,
                                             std::move(output_names));
   }
+
+  BackendPtr Create(
+      Model model, Device execution_device,
+      std::vector<std::string> output_names,
+      std::shared_ptr<ExecutionStream> execution_stream) const override {
+    return std::make_unique<OnnxCpuBackend>(std::move(model), execution_device,
+                                            std::move(output_names),
+                                            std::move(execution_stream));
+  }
 };
 
 class OnnxGpuBackendAdapter final : public BackendAdapter {
@@ -532,6 +565,15 @@ class OnnxGpuBackendAdapter final : public BackendAdapter {
                     std::vector<std::string> output_names) const override {
     return std::make_unique<OnnxGpuBackend>(std::move(model), execution_device,
                                             std::move(output_names));
+  }
+
+  BackendPtr Create(
+      Model model, Device execution_device,
+      std::vector<std::string> output_names,
+      std::shared_ptr<ExecutionStream> execution_stream) const override {
+    return std::make_unique<OnnxGpuBackend>(std::move(model), execution_device,
+                                            std::move(output_names),
+                                            std::move(execution_stream));
   }
 };
 

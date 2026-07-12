@@ -22,7 +22,9 @@
 namespace {
 
 constexpr mw::infer::ImageSize kInputSize{640, 640};
+constexpr float kScoreThreshold = 0.25F;
 constexpr float kIouThreshold = 0.45F;
+constexpr int64_t kMaxDetections = 300;
 
 struct YoloInput {
   mw::infer::Tensor tensor;
@@ -67,19 +69,26 @@ YoloInput MakeInput(cv::Mat image, mw::infer::Device device,
 std::vector<Detection> DecodeDetections(const mw::infer::Tensor& output,
                                         const mw::infer::GeometryTrace& trace) {
   mw::infer::YoloDecodeResult decoded = mw::infer::YoloDecode(output);
-  mw::infer::Tensor keep =
-      mw::infer::Nms(decoded.nms_boxes, decoded.scores, kIouThreshold);
-  mw::infer::Tensor selected_boxes = decoded.boxes.GatherRows(keep);
-  mw::infer::Tensor selected_scores = decoded.scores.GatherRows(keep);
-  mw::infer::Tensor selected_class_ids = decoded.class_ids.GatherRows(keep);
+  mw::infer::BatchNmsOptions nms_options;
+  nms_options.score_threshold = kScoreThreshold;
+  nms_options.iou_threshold = kIouThreshold;
+  nms_options.max_detections = kMaxDetections;
+  mw::infer::BatchNmsResult selected =
+      mw::infer::BatchNms(decoded.boxes, decoded.scores, nms_options);
 
-  const std::vector<float> boxes = selected_boxes.CopyToHostVector<float>();
-  const std::vector<float> scores = selected_scores.CopyToHostVector<float>();
+  const std::vector<int64_t> counts =
+      selected.counts.CopyToHostVector<int64_t>();
+  const std::vector<float> boxes = selected.boxes.CopyToHostVector<float>();
+  const std::vector<float> scores = selected.scores.CopyToHostVector<float>();
   const std::vector<int64_t> class_ids =
-      selected_class_ids.CopyToHostVector<int64_t>();
+      selected.class_ids.CopyToHostVector<int64_t>();
+  if (counts.size() != 1 || counts[0] < 0 || counts[0] > kMaxDetections) {
+    throw std::runtime_error("BatchNms returned an invalid detection count");
+  }
   std::vector<Detection> detections;
-  detections.reserve(scores.size());
-  for (std::size_t index = 0; index < scores.size(); ++index) {
+  detections.reserve(static_cast<std::size_t>(counts[0]));
+  for (int64_t detection = 0; detection < counts[0]; ++detection) {
+    const std::size_t index = static_cast<std::size_t>(detection);
     const std::size_t box_offset = index * 4;
     mw::infer::Rect2f box{boxes[box_offset], boxes[box_offset + 1],
                           boxes[box_offset + 2] - boxes[box_offset],

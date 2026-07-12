@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -639,15 +640,77 @@ ModelInfo ResolveActiveModelInfo(
 }
 
 class TensorRtBackendSession {
+  class InFlightBuffers {
+   public:
+    InFlightBuffers() {
+      CheckCuda(cudaEventCreateWithFlags(&completion_, cudaEventDisableTiming),
+                "cudaEventCreateWithFlags");
+    }
+
+    InFlightBuffers(const InFlightBuffers&) = delete;
+    InFlightBuffers& operator=(const InFlightBuffers&) = delete;
+
+    InFlightBuffers(InFlightBuffers&& other) noexcept
+        : completion_(std::exchange(other.completion_, nullptr)),
+          bound_inputs_(std::move(other.bound_inputs_)),
+          bound_outputs_(std::move(other.bound_outputs_)) {}
+
+    ~InFlightBuffers() {
+      if (completion_ != nullptr) {
+        static_cast<void>(cudaEventDestroy(completion_));
+      }
+    }
+
+    void Record(cudaStream_t stream) {
+      CheckCuda(cudaEventRecord(completion_, stream), "cudaEventRecord");
+    }
+
+    bool IsComplete() const {
+      const cudaError_t status = cudaEventQuery(completion_);
+      if (status == cudaSuccess) {
+        return true;
+      }
+      if (status == cudaErrorNotReady) {
+        return false;
+      }
+      CheckCuda(status, "cudaEventQuery");
+      return false;
+    }
+
+    void Retain(std::vector<Tensor> bound_inputs,
+                const std::vector<Tensor>& bound_outputs) {
+      bound_inputs_ = std::move(bound_inputs);
+      bound_outputs_ = bound_outputs;
+    }
+
+   private:
+    cudaEvent_t completion_ = nullptr;
+    std::vector<Tensor> bound_inputs_;
+    std::vector<Tensor> bound_outputs_;
+  };
+
  public:
   TensorRtBackendSession(Device execution_device,
                          std::vector<std::string> output_names,
-                         const Model& model, ModelInfo& active_info)
-      : execution_device_(execution_device) {
+                         const Model& model, ModelInfo& active_info,
+                         std::shared_ptr<ExecutionStream> execution_stream)
+      : execution_device_(execution_device),
+        execution_stream_(std::move(execution_stream)),
+        synchronize_after_infer_(!execution_stream_) {
     if (execution_device_.type != DeviceType::kCuda ||
         execution_device_.id < 0) {
       throw std::invalid_argument(
           "TensorRT backend requires a non-negative CUDA device");
+    }
+    if (!execution_stream_) {
+      execution_stream_ = std::make_shared<ExecutionStream>(
+          execution_device_, CudaStreamMode::kBlocking);
+    }
+    const Device stream_device = execution_stream_->device();
+    if (stream_device.type != execution_device_.type ||
+        stream_device.id != execution_device_.id) {
+      throw std::invalid_argument(
+          "TensorRT execution stream device does not match backend device");
     }
     CheckCuda(cudaSetDevice(execution_device_.id), "cudaSetDevice");
 
@@ -670,23 +733,18 @@ class TensorRtBackendSession {
       throw std::runtime_error(
           "TensorRT execution context did not select profile0");
     }
-    CheckCuda(cudaStreamCreate(&stream_), "cudaStreamCreate");
   }
 
   TensorRtBackendSession(const TensorRtBackendSession&) = delete;
   TensorRtBackendSession& operator=(const TensorRtBackendSession&) = delete;
 
-  ~TensorRtBackendSession() {
-    if (stream_ != nullptr) {
-      static_cast<void>(cudaSetDevice(execution_device_.id));
-      static_cast<void>(cudaStreamDestroy(stream_));
-    }
-  }
+  ~TensorRtBackendSession() { execution_stream_->SynchronizeNoThrow(); }
 
   std::vector<Tensor> Infer(const std::vector<Tensor>& inputs,
                             const ModelInfo& model_info,
                             TensorAllocator& allocator) {
     CheckCuda(cudaSetDevice(execution_device_.id), "cudaSetDevice");
+    ReapCompletedBuffers();
     std::vector<const Tensor*> ordered_inputs =
         ResolveInputs(inputs, model_info);
     std::vector<Tensor> staged_inputs;
@@ -698,10 +756,30 @@ class TensorRtBackendSession {
     std::vector<Tensor> all_outputs = AllocateOutputs(allocator);
     BindOutputs(all_outputs);
 
-    api_->Enqueue(stream_);
-    CheckCuda(cudaStreamSynchronize(stream_), "cudaStreamSynchronize");
-
-    return SelectOutputs(std::move(all_outputs));
+    std::unique_ptr<InFlightBuffers> in_flight;
+    if (!synchronize_after_infer_) {
+      in_flight = std::make_unique<InFlightBuffers>();
+      std::vector<Tensor> bound_input_owners;
+      bound_input_owners.reserve(bound_inputs.size());
+      for (const Tensor* input : bound_inputs) {
+        bound_input_owners.push_back(*input);
+      }
+      in_flight->Retain(std::move(bound_input_owners), all_outputs);
+    }
+    try {
+      api_->Enqueue(execution_stream_->cuda_handle());
+      if (synchronize_after_infer_) {
+        execution_stream_->Synchronize();
+        return SelectOutputs(&all_outputs);
+      }
+      in_flight->Record(execution_stream_->cuda_handle());
+      std::vector<Tensor> selected_outputs = SelectOutputs(&all_outputs);
+      in_flight_buffers_.push_back(std::move(*in_flight));
+      return selected_outputs;
+    } catch (...) {
+      execution_stream_->SynchronizeNoThrow();
+      throw;
+    }
   }
 
  private:
@@ -828,32 +906,43 @@ class TensorRtBackendSession {
     }
   }
 
-  std::vector<Tensor> SelectOutputs(std::vector<Tensor> all_outputs) const {
+  void ReapCompletedBuffers() {
+    while (!in_flight_buffers_.empty() &&
+           in_flight_buffers_.front().IsComplete()) {
+      in_flight_buffers_.pop_front();
+    }
+  }
+
+  std::vector<Tensor> SelectOutputs(
+      std::vector<Tensor>* all_outputs) const {
     std::vector<Tensor> selected_outputs;
     selected_outputs.reserve(return_output_indices_.size());
     for (std::size_t index : return_output_indices_) {
-      selected_outputs.push_back(std::move(all_outputs[index]));
+      selected_outputs.push_back(std::move(all_outputs->at(index)));
     }
     return selected_outputs;
   }
 
   Device execution_device_;
+  std::shared_ptr<ExecutionStream> execution_stream_;
+  bool synchronize_after_infer_ = true;
   std::unique_ptr<nvinfer1::IRuntime> runtime_;
   std::unique_ptr<nvinfer1::ICudaEngine> engine_;
   std::unique_ptr<nvinfer1::IExecutionContext> context_;
   std::unique_ptr<TensorRtApi> api_;
-  cudaStream_t stream_ = nullptr;
   std::vector<TensorInfo> all_output_infos_;
   std::vector<std::size_t> return_output_indices_;
+  std::deque<InFlightBuffers> in_flight_buffers_;
 };
 
 class TensorRtBackend final : public IBackend {
  public:
   TensorRtBackend(Model model, Device execution_device,
-                  std::vector<std::string> output_names)
+                  std::vector<std::string> output_names,
+                  std::shared_ptr<ExecutionStream> execution_stream = nullptr)
       : IBackend(std::move(model), execution_device),
         session_(execution_device, std::move(output_names), mutable_model(),
-                 mutable_model().info) {}
+                 mutable_model().info, std::move(execution_stream)) {}
 
   std::vector<Tensor> Infer(const std::vector<Tensor>& inputs) override {
     return Infer(inputs, TensorAllocator::Default());
@@ -880,6 +969,15 @@ class TensorRtBackendAdapter final : public BackendAdapter {
                     std::vector<std::string> output_names) const override {
     return std::make_unique<TensorRtBackend>(std::move(model), execution_device,
                                              std::move(output_names));
+  }
+
+  BackendPtr Create(
+      Model model, Device execution_device,
+      std::vector<std::string> output_names,
+      std::shared_ptr<ExecutionStream> execution_stream) const override {
+    return std::make_unique<TensorRtBackend>(std::move(model), execution_device,
+                                             std::move(output_names),
+                                             std::move(execution_stream));
   }
 };
 

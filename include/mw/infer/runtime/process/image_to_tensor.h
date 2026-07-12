@@ -4,6 +4,7 @@
 #include <memory>
 #include <vector>
 
+#include "mw/infer/runtime/execution_stream.h"
 #include "mw/infer/runtime/input/input.h"
 #include "mw/infer/runtime/tensor/tensor.h"
 #include "mw/infer/runtime/tensor/tensor_allocator.h"
@@ -23,6 +24,11 @@ class ImageToTensorAdapter {
                         const TensorInfo& input, TensorLayout layout) const = 0;
   virtual void Convert(const RawImageBatch& images, Tensor* output,
                        TensorLayout layout) const = 0;
+  virtual void Convert(const RawImageBatch& images, Tensor* output,
+                       ExecutionStream& stream, TensorLayout layout) const {
+    static_cast<void>(stream);
+    Convert(images, output, layout);
+  }
 };
 
 class ImageToTensorConverter {
@@ -43,6 +49,12 @@ class ImageToTensorConverter {
                  const TensorInfo& input,
                  TensorLayout layout = TensorLayout::kBchw,
                  TensorAllocator& allocator = TensorAllocator::Default()) const;
+  // CUDA work is enqueued on stream. Keep output alive until the stream is
+  // synchronized. CPU adapters remain synchronous by default.
+  Tensor Convert(const RawImageBatch& images, Device target_device,
+                 const TensorInfo& input, ExecutionStream& stream,
+                 TensorLayout layout = TensorLayout::kBchw,
+                 TensorAllocator& allocator = TensorAllocator::Default()) const;
 
  private:
   void AddAdapter(std::unique_ptr<ImageToTensorAdapter> adapter);
@@ -56,6 +68,10 @@ class ImageToTensorConverter {
 
 Tensor ToTensor(const RawImageBatch& images, Device target_device,
                 const TensorInfo& input,
+                TensorLayout layout = TensorLayout::kBchw,
+                TensorAllocator& allocator = TensorAllocator::Default());
+Tensor ToTensor(const RawImageBatch& images, Device target_device,
+                const TensorInfo& input, ExecutionStream& stream,
                 TensorLayout layout = TensorLayout::kBchw,
                 TensorAllocator& allocator = TensorAllocator::Default());
 

@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "mw/infer/runtime/backend/model.h"
+#include "mw/infer/runtime/execution_stream.h"
 #include "mw/infer/runtime/tensor/tensor.h"
 
 namespace mw::infer {
@@ -65,6 +66,10 @@ class BackendAdapter {
   virtual bool Supports(const Model& model, Device execution_device) const = 0;
   virtual BackendPtr Create(Model model, Device execution_device,
                             std::vector<std::string> output_names) const = 0;
+  virtual BackendPtr Create(
+      Model model, Device execution_device,
+      std::vector<std::string> output_names,
+      std::shared_ptr<ExecutionStream> execution_stream) const;
 };
 
 class BackendFactory {
@@ -78,6 +83,11 @@ class BackendFactory {
   BackendPtr Create(Model model,
                     Device execution_device = Device{DeviceType::kCpu, 0},
                     std::vector<std::string> output_names = {}) const;
+  // An injected CUDA stream is caller-managed: Infer may return after work is
+  // enqueued, and the caller must synchronize before consuming its outputs.
+  BackendPtr Create(Model model, Device execution_device,
+                    std::vector<std::string> output_names,
+                    std::shared_ptr<ExecutionStream> execution_stream) const;
 
  private:
   void AddAdapter(std::unique_ptr<BackendAdapter> adapter);
@@ -88,6 +98,9 @@ class BackendFactory {
 BackendPtr CreateBackend(Model model,
                          Device execution_device = Device{DeviceType::kCpu, 0},
                          std::vector<std::string> output_names = {});
+BackendPtr CreateBackend(Model model, Device execution_device,
+                         std::vector<std::string> output_names,
+                         std::shared_ptr<ExecutionStream> execution_stream);
 
 }  // namespace mw::infer
 

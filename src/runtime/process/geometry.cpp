@@ -77,6 +77,18 @@ Rect CenterCropRect(ImageSize image_size, ImageSize crop_size) {
               crop_size.height};
 }
 
+bool SameDevice(Device lhs, Device rhs) {
+  return lhs.type == rhs.type && lhs.id == rhs.id;
+}
+
+void ValidateStreamDevice(const RawImage& image, ExecutionStream& stream,
+                          const char* operation) {
+  if (!SameDevice(image.device(), stream.device())) {
+    throw std::invalid_argument(std::string(operation) +
+                                " stream device does not match image device");
+  }
+}
+
 const char* GeometryStepName(GeometryStepKind kind) {
   switch (kind) {
     case GeometryStepKind::kResize:
@@ -308,6 +320,18 @@ GeometryResult::GeometryResult(RawImageBatch images,
   }
 }
 
+GeometryResult::GeometryResult(RawImageBatch images,
+                               std::vector<GeometryTrace> traces,
+                               std::vector<RawImage> keep_alive)
+    : images_(std::move(images)),
+      traces_(std::move(traces)),
+      keep_alive_(std::move(keep_alive)) {
+  if (traces_.size() != images_.size()) {
+    throw std::invalid_argument(
+        "GeometryResult image count and trace count mismatch");
+  }
+}
+
 bool GeometryResult::empty() const { return images_.empty(); }
 
 std::size_t GeometryResult::size() const { return images_.size(); }
@@ -360,25 +384,42 @@ bool GeometryTransformer::Supports(const RawImage& image) const {
   return false;
 }
 
-GeometryResult GeometryTransformer::Resize(GeometryResult result,
-                                           ImageSize size,
-                                           Interpolation interpolation) const {
+GeometryResult GeometryTransformer::ResizeImpl(
+    GeometryResult result, ImageSize size, Interpolation interpolation,
+    ExecutionStream* stream) const {
   ValidateSize(size, "Resize size");
   std::vector<RawImage> output_images;
   output_images.reserve(result.size());
   std::vector<GeometryTrace> traces = result.traces();
+  std::vector<RawImage> keep_alive = std::move(result.keep_alive_);
   const std::vector<RawImage>& input_images = result.images().images();
+  if (stream != nullptr) {
+    keep_alive.insert(keep_alive.end(), input_images.begin(),
+                      input_images.end());
+  }
   for (std::size_t index = 0; index < input_images.size(); ++index) {
     const RawImage& image = input_images[index];
     const ImageSize before_size = image.size();
     ValidateSize(before_size, "Resize input size");
 
     const GeometryAdapter& adapter = SelectAdapter(image);
-    output_images.push_back(adapter.Resize(image, size, interpolation));
+    if (stream == nullptr) {
+      output_images.push_back(adapter.Resize(image, size, interpolation));
+    } else {
+      ValidateStreamDevice(image, *stream, "Resize");
+      output_images.push_back(
+          adapter.Resize(image, size, *stream, interpolation));
+    }
     traces[index].AddResize(before_size, size);
   }
   return GeometryResult(MakeRawImageBatch(std::move(output_images)),
-                        std::move(traces));
+                        std::move(traces), std::move(keep_alive));
+}
+
+GeometryResult GeometryTransformer::Resize(GeometryResult result,
+                                           ImageSize size,
+                                           Interpolation interpolation) const {
+  return ResizeImpl(std::move(result), size, interpolation, nullptr);
 }
 
 GeometryResult GeometryTransformer::Resize(RawImageBatch images, ImageSize size,
@@ -386,23 +427,55 @@ GeometryResult GeometryTransformer::Resize(RawImageBatch images, ImageSize size,
   return this->Resize(GeometryResult(std::move(images)), size, interpolation);
 }
 
-GeometryResult GeometryTransformer::ResizeShortSide(
-    GeometryResult result, int short_side, Interpolation interpolation) const {
+GeometryResult GeometryTransformer::Resize(
+    GeometryResult result, ImageSize size, ExecutionStream& stream,
+    Interpolation interpolation) const {
+  return ResizeImpl(std::move(result), size, interpolation, &stream);
+}
+
+GeometryResult GeometryTransformer::Resize(
+    RawImageBatch images, ImageSize size, ExecutionStream& stream,
+    Interpolation interpolation) const {
+  return ResizeImpl(GeometryResult(std::move(images)), size, interpolation,
+                    &stream);
+}
+
+GeometryResult GeometryTransformer::ResizeShortSideImpl(
+    GeometryResult result, int short_side, Interpolation interpolation,
+    ExecutionStream* stream) const {
   std::vector<RawImage> output_images;
   output_images.reserve(result.size());
   std::vector<GeometryTrace> traces = result.traces();
+  std::vector<RawImage> keep_alive = std::move(result.keep_alive_);
   const std::vector<RawImage>& input_images = result.images().images();
+  if (stream != nullptr) {
+    keep_alive.insert(keep_alive.end(), input_images.begin(),
+                      input_images.end());
+  }
   for (std::size_t index = 0; index < input_images.size(); ++index) {
     const RawImage& image = input_images[index];
     const ImageSize before_size = image.size();
     const ImageSize resized_size = ResizeShortSideSize(before_size, short_side);
 
     const GeometryAdapter& adapter = SelectAdapter(image);
-    output_images.push_back(adapter.Resize(image, resized_size, interpolation));
+    if (stream == nullptr) {
+      output_images.push_back(
+          adapter.Resize(image, resized_size, interpolation));
+    } else {
+      ValidateStreamDevice(image, *stream, "ResizeShortSide");
+      output_images.push_back(
+          adapter.Resize(image, resized_size, *stream, interpolation));
+    }
     traces[index].AddResize(before_size, resized_size);
   }
   return GeometryResult(MakeRawImageBatch(std::move(output_images)),
-                        std::move(traces));
+                        std::move(traces), std::move(keep_alive));
+}
+
+GeometryResult GeometryTransformer::ResizeShortSide(
+    GeometryResult result, int short_side, Interpolation interpolation) const {
+  return ResizeShortSideImpl(std::move(result), short_side, interpolation,
+                             nullptr);
 }
 
 GeometryResult GeometryTransformer::ResizeShortSide(
@@ -411,24 +484,55 @@ GeometryResult GeometryTransformer::ResizeShortSide(
                                interpolation);
 }
 
-GeometryResult GeometryTransformer::Pad(GeometryResult result, Padding padding,
-                                        FillValue value) const {
+GeometryResult GeometryTransformer::ResizeShortSide(
+    GeometryResult result, int short_side, ExecutionStream& stream,
+    Interpolation interpolation) const {
+  return ResizeShortSideImpl(std::move(result), short_side, interpolation,
+                             &stream);
+}
+
+GeometryResult GeometryTransformer::ResizeShortSide(
+    RawImageBatch images, int short_side, ExecutionStream& stream,
+    Interpolation interpolation) const {
+  return ResizeShortSideImpl(GeometryResult(std::move(images)), short_side,
+                             interpolation, &stream);
+}
+
+GeometryResult GeometryTransformer::PadImpl(GeometryResult result,
+                                            Padding padding, FillValue value,
+                                            ExecutionStream* stream) const {
   ValidatePadding(padding);
   std::vector<RawImage> output_images;
   output_images.reserve(result.size());
   std::vector<GeometryTrace> traces = result.traces();
+  std::vector<RawImage> keep_alive = std::move(result.keep_alive_);
   const std::vector<RawImage>& input_images = result.images().images();
+  if (stream != nullptr) {
+    keep_alive.insert(keep_alive.end(), input_images.begin(),
+                      input_images.end());
+  }
   for (std::size_t index = 0; index < input_images.size(); ++index) {
     const RawImage& image = input_images[index];
     const ImageSize before_size = image.size();
     ValidateSize(before_size, "Pad input size");
 
     const GeometryAdapter& adapter = SelectAdapter(image);
-    output_images.push_back(adapter.Pad(image, padding, value));
+    if (stream == nullptr) {
+      output_images.push_back(adapter.Pad(image, padding, value));
+    } else {
+      ValidateStreamDevice(image, *stream, "Pad");
+      output_images.push_back(adapter.Pad(image, padding, *stream, value));
+    }
     traces[index].AddPad(before_size, padding);
   }
   return GeometryResult(MakeRawImageBatch(std::move(output_images)),
-                        std::move(traces));
+                        std::move(traces), std::move(keep_alive));
+}
+
+GeometryResult GeometryTransformer::Pad(GeometryResult result,
+                                        Padding padding,
+                                        FillValue value) const {
+  return PadImpl(std::move(result), padding, std::move(value), nullptr);
 }
 
 GeometryResult GeometryTransformer::Pad(RawImageBatch images, Padding padding,
@@ -437,12 +541,31 @@ GeometryResult GeometryTransformer::Pad(RawImageBatch images, Padding padding,
                    std::move(value));
 }
 
-GeometryResult GeometryTransformer::Crop(GeometryResult result,
-                                         Rect rect) const {
+GeometryResult GeometryTransformer::Pad(GeometryResult result,
+                                        Padding padding,
+                                        ExecutionStream& stream,
+                                        FillValue value) const {
+  return PadImpl(std::move(result), padding, std::move(value), &stream);
+}
+
+GeometryResult GeometryTransformer::Pad(RawImageBatch images, Padding padding,
+                                        ExecutionStream& stream,
+                                        FillValue value) const {
+  return PadImpl(GeometryResult(std::move(images)), padding, std::move(value),
+                 &stream);
+}
+
+GeometryResult GeometryTransformer::CropImpl(GeometryResult result, Rect rect,
+                                             ExecutionStream* stream) const {
   std::vector<RawImage> output_images;
   output_images.reserve(result.size());
   std::vector<GeometryTrace> traces = result.traces();
+  std::vector<RawImage> keep_alive = std::move(result.keep_alive_);
   const std::vector<RawImage>& input_images = result.images().images();
+  if (stream != nullptr) {
+    keep_alive.insert(keep_alive.end(), input_images.begin(),
+                      input_images.end());
+  }
   for (std::size_t index = 0; index < input_images.size(); ++index) {
     const RawImage& image = input_images[index];
     const ImageSize before_size = image.size();
@@ -450,11 +573,21 @@ GeometryResult GeometryTransformer::Crop(GeometryResult result,
     ValidateCropRect(before_size, rect);
 
     const GeometryAdapter& adapter = SelectAdapter(image);
-    output_images.push_back(adapter.Crop(image, rect));
+    if (stream == nullptr) {
+      output_images.push_back(adapter.Crop(image, rect));
+    } else {
+      ValidateStreamDevice(image, *stream, "Crop");
+      output_images.push_back(adapter.Crop(image, rect, *stream));
+    }
     traces[index].AddCrop(before_size, rect);
   }
   return GeometryResult(MakeRawImageBatch(std::move(output_images)),
-                        std::move(traces));
+                        std::move(traces), std::move(keep_alive));
+}
+
+GeometryResult GeometryTransformer::Crop(GeometryResult result,
+                                         Rect rect) const {
+  return CropImpl(std::move(result), rect, nullptr);
 }
 
 GeometryResult GeometryTransformer::Crop(RawImageBatch images,
@@ -462,13 +595,28 @@ GeometryResult GeometryTransformer::Crop(RawImageBatch images,
   return this->Crop(GeometryResult(std::move(images)), rect);
 }
 
-GeometryResult GeometryTransformer::CenterCrop(GeometryResult result,
-                                               ImageSize size) const {
+GeometryResult GeometryTransformer::Crop(GeometryResult result, Rect rect,
+                                         ExecutionStream& stream) const {
+  return CropImpl(std::move(result), rect, &stream);
+}
+
+GeometryResult GeometryTransformer::Crop(RawImageBatch images, Rect rect,
+                                         ExecutionStream& stream) const {
+  return CropImpl(GeometryResult(std::move(images)), rect, &stream);
+}
+
+GeometryResult GeometryTransformer::CenterCropImpl(
+    GeometryResult result, ImageSize size, ExecutionStream* stream) const {
   ValidateSize(size, "CenterCrop size");
   std::vector<RawImage> output_images;
   output_images.reserve(result.size());
   std::vector<GeometryTrace> traces = result.traces();
+  std::vector<RawImage> keep_alive = std::move(result.keep_alive_);
   const std::vector<RawImage>& input_images = result.images().images();
+  if (stream != nullptr) {
+    keep_alive.insert(keep_alive.end(), input_images.begin(),
+                      input_images.end());
+  }
   for (std::size_t index = 0; index < input_images.size(); ++index) {
     const RawImage& image = input_images[index];
     const ImageSize before_size = image.size();
@@ -476,11 +624,21 @@ GeometryResult GeometryTransformer::CenterCrop(GeometryResult result,
 
     const Rect crop_rect = CenterCropRect(before_size, size);
     const GeometryAdapter& adapter = SelectAdapter(image);
-    output_images.push_back(adapter.Crop(image, crop_rect));
+    if (stream == nullptr) {
+      output_images.push_back(adapter.Crop(image, crop_rect));
+    } else {
+      ValidateStreamDevice(image, *stream, "CenterCrop");
+      output_images.push_back(adapter.Crop(image, crop_rect, *stream));
+    }
     traces[index].AddCrop(before_size, crop_rect);
   }
   return GeometryResult(MakeRawImageBatch(std::move(output_images)),
-                        std::move(traces));
+                        std::move(traces), std::move(keep_alive));
+}
+
+GeometryResult GeometryTransformer::CenterCrop(GeometryResult result,
+                                               ImageSize size) const {
+  return CenterCropImpl(std::move(result), size, nullptr);
 }
 
 GeometryResult GeometryTransformer::CenterCrop(RawImageBatch images,
@@ -488,15 +646,32 @@ GeometryResult GeometryTransformer::CenterCrop(RawImageBatch images,
   return this->CenterCrop(GeometryResult(std::move(images)), size);
 }
 
-GeometryResult GeometryTransformer::LetterBox(GeometryResult result,
-                                              ImageSize size,
-                                              Interpolation interpolation,
-                                              FillValue value) const {
+GeometryResult GeometryTransformer::CenterCrop(GeometryResult result,
+                                               ImageSize size,
+                                               ExecutionStream& stream) const {
+  return CenterCropImpl(std::move(result), size, &stream);
+}
+
+GeometryResult GeometryTransformer::CenterCrop(RawImageBatch images,
+                                               ImageSize size,
+                                               ExecutionStream& stream) const {
+  return CenterCropImpl(GeometryResult(std::move(images)), size, &stream);
+}
+
+GeometryResult GeometryTransformer::LetterBoxImpl(
+    GeometryResult result, ImageSize size, Interpolation interpolation,
+    FillValue value, ExecutionStream* stream) const {
   ValidateSize(size, "LetterBox size");
   std::vector<RawImage> output_images;
   output_images.reserve(result.size());
   std::vector<GeometryTrace> traces = result.traces();
+  std::vector<RawImage> keep_alive = std::move(result.keep_alive_);
   const std::vector<RawImage>& input_images = result.images().images();
+  if (stream != nullptr) {
+    keep_alive.insert(keep_alive.end(), input_images.begin(),
+                      input_images.end());
+    keep_alive.reserve(keep_alive.size() + input_images.size());
+  }
   for (std::size_t index = 0; index < input_images.size(); ++index) {
     const RawImage& image = input_images[index];
     const ImageSize before_size = image.size();
@@ -506,13 +681,33 @@ GeometryResult GeometryTransformer::LetterBox(GeometryResult result,
     const Padding padding = CenterPadding(resized_size, size);
     const GeometryAdapter& adapter = SelectAdapter(image);
 
-    RawImage resized = adapter.Resize(image, resized_size, interpolation);
+    RawImage resized;
+    if (stream == nullptr) {
+      resized = adapter.Resize(image, resized_size, interpolation);
+    } else {
+      ValidateStreamDevice(image, *stream, "LetterBox");
+      resized = adapter.Resize(image, resized_size, *stream, interpolation);
+    }
     const GeometryAdapter& pad_adapter = SelectAdapter(resized);
-    output_images.push_back(pad_adapter.Pad(resized, padding, value));
+    if (stream == nullptr) {
+      output_images.push_back(pad_adapter.Pad(resized, padding, value));
+    } else {
+      output_images.push_back(
+          pad_adapter.Pad(resized, padding, *stream, value));
+      keep_alive.push_back(resized);
+    }
     traces[index].AddLetterBox(before_size, size, resized_size, padding);
   }
   return GeometryResult(MakeRawImageBatch(std::move(output_images)),
-                        std::move(traces));
+                        std::move(traces), std::move(keep_alive));
+}
+
+GeometryResult GeometryTransformer::LetterBox(GeometryResult result,
+                                              ImageSize size,
+                                              Interpolation interpolation,
+                                              FillValue value) const {
+  return LetterBoxImpl(std::move(result), size, interpolation,
+                       std::move(value), nullptr);
 }
 
 GeometryResult GeometryTransformer::LetterBox(RawImageBatch images,
@@ -521,6 +716,20 @@ GeometryResult GeometryTransformer::LetterBox(RawImageBatch images,
                                               FillValue value) const {
   return this->LetterBox(GeometryResult(std::move(images)), size, interpolation,
                          std::move(value));
+}
+
+GeometryResult GeometryTransformer::LetterBox(
+    GeometryResult result, ImageSize size, ExecutionStream& stream,
+    Interpolation interpolation, FillValue value) const {
+  return LetterBoxImpl(std::move(result), size, interpolation,
+                       std::move(value), &stream);
+}
+
+GeometryResult GeometryTransformer::LetterBox(
+    RawImageBatch images, ImageSize size, ExecutionStream& stream,
+    Interpolation interpolation, FillValue value) const {
+  return LetterBoxImpl(GeometryResult(std::move(images)), size, interpolation,
+                       std::move(value), &stream);
 }
 
 const GeometryAdapter& GeometryTransformer::SelectAdapter(

@@ -1,9 +1,12 @@
 #include <cuda_runtime_api.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "mw/infer/runtime/process/channel.h"
@@ -22,36 +25,6 @@ void CheckCuda(cudaError_t status, const char* operation) {
     throw std::runtime_error(CudaErrorMessage(status, operation));
   }
 }
-
-template <typename T>
-class DeviceBuffer {
- public:
-  explicit DeviceBuffer(std::size_t count) : count_(count) {
-    CheckCuda(cudaMalloc(reinterpret_cast<void**>(&data_), count * sizeof(T)),
-              "cudaMalloc");
-  }
-
-  DeviceBuffer(const DeviceBuffer&) = delete;
-  DeviceBuffer& operator=(const DeviceBuffer&) = delete;
-
-  ~DeviceBuffer() {
-    if (data_ != nullptr) {
-      static_cast<void>(cudaFree(data_));
-    }
-  }
-
-  void CopyFromHost(const T* source) {
-    CheckCuda(
-        cudaMemcpy(data_, source, count_ * sizeof(T), cudaMemcpyHostToDevice),
-        "cudaMemcpy");
-  }
-
-  T* data() { return data_; }
-
- private:
-  T* data_ = nullptr;
-  std::size_t count_ = 0;
-};
 
 struct ImageTensorShape {
   int64_t batch = 0;
@@ -92,6 +65,67 @@ int GridBlocks(std::size_t element_count) {
   return static_cast<int>(blocks);
 }
 
+std::size_t AlignUp(std::size_t value, std::size_t alignment) {
+  const std::size_t remainder = value % alignment;
+  if (remainder == 0) {
+    return value;
+  }
+  const std::size_t padding = alignment - remainder;
+  if (value > std::numeric_limits<std::size_t>::max() - padding) {
+    throw std::invalid_argument("CUDA preprocess storage size overflows");
+  }
+  return value + padding;
+}
+
+Tensor AllocateOutputAndOrder(const Tensor& input, std::size_t order_count,
+                              TensorAllocator& allocator,
+                              const std::vector<int64_t>& order,
+                              int64_t** device_order,
+                              const int64_t** host_order) {
+  const std::size_t order_offset = AlignUp(input.bytes(), alignof(int64_t));
+  if (order_count > std::numeric_limits<std::size_t>::max() / sizeof(int64_t)) {
+    throw std::invalid_argument("CUDA channel order size overflows");
+  }
+  const std::size_t order_bytes = order_count * sizeof(int64_t);
+  if (order_offset > std::numeric_limits<std::size_t>::max() - order_bytes) {
+    throw std::invalid_argument("CUDA preprocess storage size overflows");
+  }
+  const std::size_t storage_bytes = order_offset + order_bytes;
+  if (storage_bytes >
+      static_cast<std::size_t>(std::numeric_limits<int64_t>::max())) {
+    throw std::invalid_argument("CUDA preprocess storage exceeds int64 range");
+  }
+
+  TensorDesc storage_desc = input.desc();
+  storage_desc.info.data_type = DataType::kUInt8;
+  storage_desc.info.shape = {static_cast<int64_t>(storage_bytes)};
+  struct OutputOwner {
+    Tensor storage;
+    Tensor input;
+    std::vector<int64_t> order;
+  };
+  auto owner = std::make_shared<OutputOwner>();
+  owner->storage = Tensor::Allocate(std::move(storage_desc), allocator);
+  owner->input = input;
+  owner->order = order;
+  *device_order = reinterpret_cast<int64_t*>(
+      static_cast<std::byte*>(owner->storage.data()) + order_offset);
+  *host_order = owner->order.data();
+  std::shared_ptr<void> output_owner = owner;
+  return Tensor::FromExternal(MakeOutputDesc(input), owner->storage.data(),
+                              input.bytes(),
+                              std::move(output_owner));
+}
+
+void SynchronizeNoThrow(ExecutionStream* stream,
+                        cudaStream_t cuda_stream) noexcept {
+  if (stream != nullptr) {
+    stream->SynchronizeNoThrow();
+    return;
+  }
+  static_cast<void>(cudaStreamSynchronize(cuda_stream));
+}
+
 __global__ void ReorderChannelsKernel(const float* input, float* output,
                                       const int64_t* order,
                                       int64_t element_count, int64_t channels,
@@ -122,23 +156,36 @@ __global__ void ReorderChannelsKernel(const float* input, float* output,
 
 Tensor RunReorderChannelsOnDevice(const Tensor& input,
                                   const std::vector<int64_t>& order,
-                                  TensorLayout layout,
+                                  TensorLayout layout, ExecutionStream* stream,
                                   TensorAllocator& allocator) {
   CheckCuda(cudaSetDevice(input.device().id), "cudaSetDevice");
-
-  DeviceBuffer<int64_t> device_order(order.size());
-  device_order.CopyFromHost(order.data());
-
-  Tensor output = Tensor::Allocate(MakeOutputDesc(input), allocator);
-  const ImageTensorShape shape = TensorShape(input, layout);
-  const int layout_id = layout == TensorLayout::kBchw ? 0 : 1;
-  ReorderChannelsKernel<<<GridBlocks(input.element_count()),
-                          kThreadsPerBlock>>>(
-      static_cast<const float*>(input.data()),
-      static_cast<float*>(output.data()), device_order.data(),
-      static_cast<int64_t>(input.element_count()), shape.channels, shape.height,
-      shape.width, layout_id);
-  CheckCuda(cudaGetLastError(), "ReorderChannelsKernel");
+  const cudaStream_t cuda_stream =
+      stream == nullptr ? nullptr : stream->cuda_handle();
+  int64_t* device_order = nullptr;
+  const int64_t* host_order = nullptr;
+  Tensor output = AllocateOutputAndOrder(input, order.size(), allocator, order,
+                                         &device_order, &host_order);
+  try {
+    CheckCuda(cudaMemcpyAsync(device_order, host_order,
+                              order.size() * sizeof(int64_t),
+                              cudaMemcpyHostToDevice, cuda_stream),
+              "cudaMemcpyAsync");
+    const ImageTensorShape shape = TensorShape(input, layout);
+    const int layout_id = layout == TensorLayout::kBchw ? 0 : 1;
+    ReorderChannelsKernel<<<GridBlocks(input.element_count()),
+                            kThreadsPerBlock, 0, cuda_stream>>>(
+        static_cast<const float*>(input.data()),
+        static_cast<float*>(output.data()), device_order,
+        static_cast<int64_t>(input.element_count()), shape.channels,
+        shape.height, shape.width, layout_id);
+    CheckCuda(cudaGetLastError(), "ReorderChannelsKernel");
+    if (stream == nullptr) {
+      CheckCuda(cudaStreamSynchronize(cuda_stream), "cudaStreamSynchronize");
+    }
+  } catch (...) {
+    SynchronizeNoThrow(stream, cuda_stream);
+    throw;
+  }
   return output;
 }
 
